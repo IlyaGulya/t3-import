@@ -1,0 +1,5 @@
+{
+  "repository": "https://github.com/pingdotgg/t3code.git",
+  "commit": "ea6d3fc30fb066635f31326f49b85cdee8fbf8d7",
+  "supportedMigrations": [96, 97, 98]
+}

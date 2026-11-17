@@ -1,141 +1,152 @@
 # t3-import
 
-`t3-import` is an independent, local-only CLI for importing Codex and Claude Code conversation history into [T3 Code](https://github.com/pingdotgg/t3code). It writes canonical orchestration events while T3 is closed; T3 rebuilds its own projections on the next launch. The original provider session is bound so the current branch can resume when the source history is still available.
+Import rich Codex, Oh My Pi and Claude Code history into current T3 Code using the tools that own the formats:
 
-Compatibility is intentionally explicit: **T3 migrations 40–53**, Node.js 22 or newer, and local files only. Unknown T3 schemas fail closed.
+- Codex's `app-server` reads sessions, turns and items through T3's typed client.
+- Oh My Pi's installed package reads its own entries, branches, compactions and image blobs.
+- Claude Agent SDK reads selected session histories and native child-agent transcripts.
+- T3's pinned `EventSink` and repositories write events, projections and native resume bindings.
 
-## How it works
+There is no independent rollout parser or copy of T3's projection SQL. This version replaces the old importer; it supports **T3 migrations 96–98**, not the earlier 40–53 schemas. The CLI provides `list`, `show`, `projects`, `doctor` and `import`. It does not include the old TUI, parsers, `sync` or `replace` commands.
 
-`t3-import` reads local Codex conversations through `codex app-server` and Codex rollout JSONL files. It reads Claude Code sessions from the JSONL files under `~/.claude/projects/`. The source data is normalized into conversations, turns, messages, tool activity, plans, usage, and supported image attachments.
+## Build
 
-To keep T3 startup bounded, imports preserve every message, turn boundary, plan, image, error or approval, context compaction, and resume binding while compacting repetitive activity telemetry. Context-window snapshots are omitted, and long turns retain the latest visible reasoning summary plus a representative significant tool activity. The importer rejects any write that would exceed T3's safe one-launch projection budget.
+Requires Node.js 26+, Git and npm. OMP reading additionally needs Bun and the installed `@oh-my-pi/pi-coding-agent@18.22.0` package. The build uses a pinned T3 checkout; the built Codex CLI does not need that checkout at runtime.
 
-With T3 Code closed, the importer validates the local database against the supported migration profiles and creates a verified backup. It then appends canonical events to `orchestration_events` and adds provider-session bindings for conversations that can be resumed. It does not modify T3's projection tables: T3 Code rebuilds them from the imported events the next time it starts. After a successful write, the importer also backs up and resets T3's rebuildable IndexedDB origin cache so stale task snapshots cannot hide newly imported history.
-
-After an initial import, `t3-import` can append newly settled Codex turns and newly settled turns from linear Claude conversations. Completed, interrupted, and failed turns are preserved; only genuinely active or indeterminate turns are ignored during synchronization. It verifies that the imported checkpoint is still an exact prefix, adopts exact turns already created by resuming through T3, and never replaces edited or deleted history. Claude sessions with multiple non-sidechain leaves after deterministic compaction and retry normalization are reported as conflicts rather than guessed.
-
-If an imported task has diverged or was created by an older importer, `replace` can create a fresh, complete canonical task from the provider transcript. The old task is soft-deleted with a `thread.deleted` event, while its immutable event stream remains available for audit. The provider instance, model, resume cursor, project, and synchronization identity move to the new task atomically. When deterministic normalization reduces a previously fragmented Claude session to one leaf, replacement consolidates every still-visible imported fragment of that session into the new task. Replacement is available for Codex and for Claude sessions with one normalized non-sidechain leaf, and it refuses to snapshot an active provider turn.
-
-## Install and run
-
-> [!WARNING]
-> `t3-import` is experimental and writes directly to T3 Code's local database. Future T3 Code versions may be incompatible even if the tool works today. Close T3 Code before importing, keep the generated backup, and use this tool at your own risk.
-
-```text
-npm install --global @carlosgtrz/t3-import
-t3-import
+```sh
+git clone --filter=blob:none https://github.com/pingdotgg/t3code.git repos/t3code
+git -C repos/t3code checkout ea6d3fc30fb066635f31326f49b85cdee8fbf8d7
+bun add --global @oh-my-pi/pi-coding-agent@18.22.0
+npm ci
+npm run build
+node dist/cli.js --help
 ```
 
-Running without a command opens the interactive TUI. It guides you through source, workspace, provider instance, conversation selection, review, confirmation, and results, then offers to start T3 Code with Yes selected by default.
+An existing sibling `../t3code` checkout is also detected. Set `T3_NATIVE_REFERENCE_REPO` to use another checkout. The builder rejects the wrong commit and tracked source edits so a new upstream version cannot silently change the persistence code.
 
-## Interactive demo
+## Codex
 
-The example below installs the package, launches `t3-import` without parameters, selects Codex, and imports two simulated conversations into T3 Code.
+List and inspect history while T3 is running:
 
-![Animated t3-import interactive Codex import](https://raw.githubusercontent.com/CarlosGtrz/t3-import/main/assets/t3-import-tui-demo.gif)
-
-Non-interactive examples:
-
-```text
-t3-import list --source codex --workspace C:\src\my-project
-t3-import show --source claude --thread <session-id>
-t3-import import --source codex --workspace C:\src\my-project --thread <thread-id> --yes --non-interactive
-t3-import import --source claude --workspace C:\src\my-project --all --since 2026-01-01 --yes --non-interactive
-t3-import sync --source codex --workspace C:\src\my-project --thread <thread-id> --yes --non-interactive
-t3-import sync --source claude --workspace C:\src\my-project --all --yes --non-interactive
-t3-import replace --source codex --workspace C:\src\my-project --thread <thread-id> --yes --non-interactive
-t3-import cache reset --yes
-t3-import doctor --json
+```sh
+node dist/cli.js list --source codex --workspace /path/to/project
+node dist/cli.js show --source codex --workspace /path/to/project --thread SESSION_ID
+node dist/cli.js doctor
 ```
 
-Global target options can be placed before or after a subcommand:
+Review an import without writing, then close the T3 application/server before writing:
 
-```text
---t3-home <path>
---db <state.sqlite>
---attachments-dir <path>
---provider-instance <id>
---json
---no-color
---no-cache-reset            Keep the existing IndexedDB cache after writes
+```sh
+node dist/cli.js import --source codex --workspace /path/to/project --thread SESSION_ID --dry-run
+node dist/cli.js import --source codex --workspace /path/to/project --thread SESSION_ID --yes
 ```
 
-Import options:
+Repeat `--thread` to select several sessions, or use `--all` with `--workspace`. `--since ISO_TIMESTAMP` filters by updated time. `--archived` selects archived Codex sessions. `--source-home` selects another Codex home; `--binary` selects the Codex executable. The reader pages through full native history and never starts/resumes a model turn.
 
-```text
---thread <id>             Repeatable; mutually exclusive with --all
---all
---since <ISO date>
---include-incomplete
---dry-run
---yes
---non-interactive
---no-resume
+## Project grouping
+
+By default, all three sources reuse the same T3 project when their working directories resolve to the same canonical directory. Existing symlink aliases are resolved. Subdirectories, worktrees and separate clones stay separate; matching repository names or Git remotes do not merge projects automatically. `--workspace` selects source sessions and does not change their destination grouping.
+
+Use the same `--project-root` for each import to group sessions from different directories under one project. The project is reused or created for that root:
+
+```sh
+node dist/cli.js import --source codex --workspace /repo/worktrees/fix --thread SESSION_ID --project-root /repo --no-resume --dry-run
+node dist/cli.js import --source omp --workspace /repo/packages/app --thread SESSION_ID --project-root /repo --no-resume --dry-run
+node dist/cli.js import --source claude --workspace /another/clone --thread SESSION_ID --project-root /repo --no-resume --dry-run
 ```
 
-Sync options:
+List destination projects with `node dist/cli.js projects --t3-home /path/to/isolated-t3`, then use `--project-id PROJECT_ID` to select one explicitly. `--project-root` and `--project-id` are mutually exclusive. If several existing projects have the same canonical root, an explicit ID is required. A repeat import with a changed destination is rejected; this does not move previously imported threads.
 
-```text
---thread <id>             Repeatable; mutually exclusive with --all
---all                     Sync previously imported conversations only
---since <ISO date>
---dry-run
---yes
---non-interactive
+Grouping keeps each session's original directory, including child-agent directories. T3 stores a differing directory in the thread's native `worktreePath` field so later execution uses that directory. Some T3 controls may label such a directory as a worktree even when it is an ordinary folder; the importer does not invent a Git branch or create a worktree.
+
+## Oh My Pi
+
+OMP's installed source package is loaded by a small Bun helper. Its read-only loader, native tree index, format migrations and blob resolver supply the history. It does not open a writable SessionManager or launch an OMP agent.
+
+Turn timing ends at the native terminal response. Later idle model changes and compaction records retain their original timestamps as session activity outside that response. Displayed durations are elapsed native response times, not a measurement of billable compute or active CPU time.
+
+```sh
+node dist/cli.js list --source omp --workspace /path/to/project
+node dist/cli.js show --source omp --workspace /path/to/project --thread SESSION_ID
+node dist/cli.js import --source omp --workspace /path/to/project --thread SESSION_ID --no-resume --dry-run
 ```
 
-Replace options:
+For OMP, `--source-home` is the **agent directory**, normally `~/.omp/agent`, containing `sessions` and `blobs`. `--omp-package` selects an installed package directory explicitly; `--bun-binary` selects Bun. The installed package remains a runtime dependency of the OMP helper; its supported version is checked before reading.
 
-```text
---thread <id>             Repeatable and required for non-interactive use
---dry-run
---yes
---non-interactive
+To continue an imported OMP session in T3, configure an enabled **Pi driver instance that runs `t3-import-omp`**, with the matching OMP agent directory, then pass its instance ID:
+
+```sh
+node dist/cli.js import --source omp --workspace /path/to/project --thread SESSION_ID --provider-instance omp --dry-run
 ```
 
-The normal TUI labels conversations as new, syncable, up to date, active-only, or conflicted. Interrupted and failed additions are called out in the status text, and ignored active turns are shown without enabling them for synchronization. A history conflict is labeled `history changed · replace available` when it can be replaced. Replacement choices cannot be mixed with imports or ordinary syncs. The dedicated `sync` and `replace` commands open focused TUI flows when required arguments are omitted on a terminal.
+The Pi/RPC binding uses the original session file path. OMP's ACP binding uses a different contract and is not used here. `--no-resume` imports visible history without attaching a native session.
 
-When `--json` is active, stdout contains one versioned JSON value and diagnostics use stderr. Exit codes are `2` usage, `3` T3 compatibility, `4` live-T3 safety, `5` source parsing, `6` write failure, and `7` reconciliation conflict.
+`t3-import-omp` is bundled with this package (the executable file is `dist/omp.js`). It launches the installed native `omp` and translates its `session_settled` RPC frame to T3 Pi's `agent_settled`; all commands and other frames pass through unchanged. Without this compatibility step, OMP 18.22.0 can answer correctly while T3 keeps its run in `running`. Set `T3_IMPORT_OMP_BINARY` in that provider instance's environment if the native `omp` executable is not on its PATH. The bridge checks the native version before starting, and currently supports only 18.22.0. Direct native `omp` continuation bindings are rejected; history-only imports do not need the bridge.
 
-## Safety and storage
+OMP profile overrides (`OMP_PROFILE`, `PI_PROFILE` or `--profile` in the provider launch arguments) can redirect settings and blob storage independently of `PI_CODING_AGENT_DIR`. Continuation bindings with these overrides are currently rejected; import their history with `--no-resume`.
 
-- Close T3 before every real import. There is deliberately no force bypass.
-- Every write creates and verifies a timestamped SQLite backup under `<state-dir>/t3-import-backups/`.
-- Successful imports, syncs, and replacements reset T3's rebuildable IndexedDB origin cache by default. The cache is moved aside, copied and verified under the same backup directory before removal; use `--no-cache-reset` to opt out.
-- The importer appends `orchestration_events` and writes resumable rows to `provider_session_runtime`; it never writes `projection_*` tables or `projection_state`.
-- Imports are idempotent. A second import reports `already-imported`. `sync` only appends completed, interrupted, or failed turns after an unchanged checkpoint, and repeated syncs are no-ops. `replace` promotes one complete new task as the sole synchronization target and soft-deletes the old canonical task; repeating it against that unchanged replacement is also a no-op.
-- New imports are rejected when T3 has an existing projection backlog or when the compact event plan exceeds the safe 900-event startup budget.
-- Supported local image attachments are copied atomically. Remote images are referenced but not downloaded.
-- An external ledger is stored in the platform application-data directory. Event IDs provide the fallback idempotency check if the ledger is missing.
+Continuation also requires an absolute effective `PI_CODING_AGENT_DIR` when overridden, and rejects custom `PI_CONFIG_DIR` roots until native directory resolution can be verified. These restrictions do not prevent history-only imports.
 
-`doctor` reports database compatibility and integrity, live/stale runtime state, discovered IndexedDB caches, source availability, and attachment staging leftovers without changing anything. `t3-import cache reset` can perform the same recoverable cache reset without importing, synchronizing, or replacing anything. Both operations require T3 to be closed.
+## Claude Code
 
-## Source behavior
+The pinned `@anthropic-ai/claude-agent-sdk@0.3.321` supplies `listSessions`, `getSessionInfo`, `getSessionMessages`, `listSubagents` and `getSubagentMessages`. A Node helper gives the SDK its own `CLAUDE_CONFIG_DIR`; it never starts a query or a model process.
 
-Codex discovery prefers the normalized `codex app-server` API and augments it with rollout JSONL; it falls back to rollout files when app-server is unavailable. Claude discovery streams project JSONL and reconstructs its UUID graph. Automatic compaction roots are reconnected through validated `logicalParentUuid` links, and unambiguous successful API-retry forks are linearized while retaining their retry activity. Genuine alternate Claude leaves that remain become separate historical T3 tasks; only the current leaf receives a resume binding.
+```sh
+node dist/cli.js list --source claude --workspace /path/to/project
+node dist/cli.js show --source claude --thread SESSION_ID
+node dist/cli.js import --source claude --workspace /path/to/project --thread SESSION_ID --no-resume --dry-run
+```
 
-Injected system/developer/environment envelopes and encrypted reasoning blobs are excluded. Visible messages, reasoning summaries, plans, tools, usage, compaction, resolved approvals/input, and supported images are mapped to T3-compatible events.
+`--source-home` selects the Claude config directory, normally `~/.claude`. Native child and grandchild histories become linked historical T3 threads. Claude's subagent history API does not supply an independent resumable session, so those children remain history-only even when root continuation is enabled.
 
-## Development
+Old Claude archives may end in an unanswered user request or unfinished tool call. The default importer rejects these indeterminate tails. To keep them deliberately as interrupted historical snapshots, use `--snapshot --no-resume`, preferably against a copied, stable Claude config directory:
 
-The repositories under `repos/` are references and are not runtime dependencies.
+```sh
+node dist/cli.js import --source claude --source-home /path/to/copied-claude --workspace /path/to/project --thread SESSION_ID --snapshot --no-resume --dry-run
+```
 
-```text
-npm install
+Snapshot mode preserves native IDs, contents and unfinished tool calls; it creates no continuation binding and fabricates no completed result. The flag is Claude-only and requires `--no-resume`. Root source changes detected during reading still reject the import. The native SDK has no live-process ownership probe, so snapshot mode does not claim that the original process has stopped.
+
+The SDK exposes less information than the raw store: some system records lack their payload, and it has no live-process ownership probe. Available compaction summaries and native timestamps are preserved. Missing system payloads and legacy text replies without a stop reason are reported. A stable text-only historical reply with no unfinished tool call is treated as settled; an unfinished tool tail is blocked.
+
+Document and other non-image input blocks retain a visible reference and their complete native payload as historical tool content. T3's image attachment presentation cannot render them as native document attachments; the importer reports that limitation.
+
+## What is preserved
+
+Terminal runs and their native references; all visible user/assistant messages, including steers in the same run; visible reasoning; command output/status; file changes; tools; plans; compaction markers; supported local/inline images. There is no 30-day window, 200-message tail or representative-tool compaction policy. Source APIs may omit data they no longer retain; the importer reports unsupported visible records and media rather than claiming a raw byte-for-byte archive.
+
+OMP imports the native selected branch and follows native transcript visibility rules, excluding hidden bookkeeping. Its model changes are preserved per run and per assistant response, including switches inside one run. Codex currently exposes only its current thread model; unavailable historical model provenance is explicitly reported.
+
+Codex and Claude child histories become linked T3 threads when supplied by the native API. Original spawn tool records remain visible. These are terminal historical records; the importer does not start live child agents or invent historical Git checkpoints.
+
+## Storage and repeat imports
+
+`--t3-home` selects the target home (default `T3CODE_HOME`, then `~/.t3`). The target is `userdata/statev2.sqlite`. Initialize that home with T3 itself before importing; normal import does not migrate or create a T3 database.
+
+- `--dry-run` uses read-only target access and does not stage files, write a ledger or create backups.
+- Real writes hold T3's native ownership lock and require the server to be stopped.
+- Each write creates a SQLite backup and verifies its integrity first.
+- Events, projections, resume binding and import fingerprint are committed atomically; failed batches clean up their new image files.
+- No execution effects or provider workers are started by the writer.
+- Re-importing identical history reports `already-imported` without adding events or a backup.
+- Changed source history, deleted/edited target history or a native session already owned by another T3 thread produce a conflict. Incremental synchronization and replacement are not implemented in this version.
+- Resume checks the configured provider driver, enabled state and source home. OMP also requires an OMP executable. The importer does not switch providers or accounts automatically.
+
+Remote images are retained as references and are not downloaded. Source blobs that are missing or unsupported produce a diagnostic. Image presentation for tool variants may be limited by T3; any such omission is reported.
+
+`--json` prints one JSON result on stdout. `show --full` includes the normalized conversation content, so use it only when that output is wanted. The built artifact includes the pinned T3 reference and its MIT notice.
+
+## Validation
+
+```sh
 npm run typecheck
 npm test
 npm run build
 npm pack
 ```
 
-Compatibility is validated against pinned historical T3 commits for every migration from 40 through 53, including stable `v0.0.42` (`719a76ca1`) and nightly `v0.0.43-nightly.20260920.2031` (`adcd90858`). Earlier versions and unvalidated future migrations fail closed. The importer never upgrades a T3 database; T3 owns migrations, and existing imports can continue synchronizing after an upgrade within the supported range.
+Type checking checks this importer's files against actual pinned T3 source types; it does not re-check the T3 monorepo. Tests bundle native T3 modules and exercise isolated databases at every supported migration, dry-run immutability, rich history, model switches, linked children, repeat imports, conflicts, ownership locks and transaction rollback. Reader tests use the native source libraries and literal source fixtures. Codex protocol tests also use a fake app-server with T3's real client.
 
-`npm test` uses committed schemas generated from T3's actual migrations. The additional integration matrix runs the historical event decoders, projectors, and provider restoration services against synthetic databases:
+The real-server integration test uses an installed T3 executable (`~/.t3/bin/t3`, or `T3_TEST_SERVER_BINARY`) with a fresh home, disabled providers and its own loopback port. It checks HTTP history pagination, native RPC tool details, models and linked child threads, then stops its captured child process. It skips when that executable is unavailable. OMP tests require the supported installed package and Bun.
 
-```text
-npm run test:compatibility
-```
-
-This requires Git, tar, Node.js 22.21.1 or newer, network access for isolated development dependencies, and a T3 checkout containing the pinned commits at `repos/t3code` (override with `T3_REFERENCE_REPO`). It prepares source snapshots under `artifacts/compatibility`, exercises both providers at all fourteen migrations and every upgrade to 53, and writes a JSON result report. Provider processes are replaced with controlled test adapters; no paid provider work runs. The installed T3 application and live database are not used.
-
-See [compatibility validation](https://github.com/CarlosGtrz/t3-import/blob/main/docs/compatibility.md) for reference commits, fixture regeneration, and the exact validation boundary.
+See [compatibility and native dependency boundaries](docs/compatibility.md).

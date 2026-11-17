@@ -1,15 +1,13 @@
 {
   "name": "@carlosgtrz/t3-import",
-  "version": "0.4.1",
-  "description": "Import, synchronize, and safely replace Codex and Claude Code conversations in T3 Code",
+  "version": "0.5.0-native.5",
+  "description": "Import Codex, Claude Code and Oh My Pi history using native readers and T3 orchestration",
   "keywords": [
     "t3code",
     "codex",
-    "claude-code",
+    "oh-my-pi",
     "conversation",
-    "importer",
-    "cli",
-    "tui"
+    "importer"
   ],
   "author": {
     "name": "CarlosGtrz",
@@ -25,7 +23,8 @@
   "homepage": "https://github.com/CarlosGtrz/t3-import#readme",
   "type": "module",
   "bin": {
-    "t3-import": "dist/cli.js"
+    "t3-import": "dist/cli.js",
+    "t3-import-omp": "dist/omp.js"
   },
   "files": [
     "dist",
@@ -33,39 +32,47 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
-    "dev": "tsx src/cli.ts",
-    "test": "vitest run",
-    "typecheck": "tsc --noEmit",
+    "build": "node scripts/build-native.mjs",
+    "dev": "node dist/cli.js",
+    "test": "node scripts/test-native.mjs",
+    "typecheck": "node scripts/typecheck-native.mjs",
     "prepack": "npm run build",
     "prepublishOnly": "npm run typecheck && npm test",
-    "release:check": "npm publish --dry-run --access public",
-    "compat:prepare": "node scripts/compatibility/prepare.mjs",
-    "compat:schemas": "node scripts/compatibility/generate-schemas.mjs",
-    "test:compatibility": "npm run compat:prepare && tsx scripts/compatibility/run.ts"
+    "release:check": "npm publish --dry-run --access public"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=26"
   },
   "license": "MIT",
   "publishConfig": {
     "access": "public"
   },
   "dependencies": {
-    "better-sqlite3": "^12.2.0",
+    "@anthropic-ai/claude-agent-sdk": "0.3.321",
+    "@effect/platform-node": "4.1.2",
+    "@effect/platform-node-shared": "4.1.2",
     "commander": "^14.0.0",
-    "env-paths": "^3.0.0",
-    "ink": "^6.2.3",
-    "react": "^19.1.1",
-    "zod": "^4.0.17"
+    "diff": "8.0.3",
+    "effect": "4.1.3",
+    "mdast-util-directive": "3.1.0",
+    "micromark-extension-directive": "4.0.0",
+    "micromark-util-character": "2.1.1",
+    "micromark-util-decode-string": "2.0.1",
+    "property-information": "7.2.0",
+    "rehype-raw": "7.0.0",
+    "rehype-sanitize": "6.0.0",
+    "remark-breaks": "4.0.0",
+    "remark-gfm": "4.0.1",
+    "remark-math": "6.0.0",
+    "remark-parse": "11.0.0",
+    "remark-rehype": "11.1.2",
+    "unified": "11.0.5",
+    "yaml": "2.9.0"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
-    "@types/node": "^22.17.2",
-    "@types/react": "^19.1.10",
-    "ink-testing-library": "^4.0.0",
-    "tsx": "^4.20.4",
-    "typescript": "^5.9.2",
-    "vitest": "^3.2.4"
+    "@types/bun": "1.4.4",
+    "@types/node": "24.12.4",
+    "esbuild": "0.28.2",
+    "typescript": "^5.9.2"
   }
 }
