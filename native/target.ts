@@ -425,13 +425,23 @@ function linkChildPlan(parent: Plan, child: Plan, allocator: IdAllocator.IdAlloc
   const childThreadEvent = child.events[childThreadIndex]!;
   if (parentThreadEvent.type !== "thread.created" || childThreadEvent.type !== "thread.created") throw new Error("Missing imported thread creation.");
   const parentItem = child.conversation.parent?.nativeItemId ? parent.events.find(event => event.type === "turn-item.updated" && event.payload.nativeItemRef?.nativeId === child.conversation.parent?.nativeItemId) : undefined;
-  const runEvent = parent.events.find(event => event.type === "run.created" && (parentItem?.runId === undefined || event.payload.id === parentItem.runId));
-  if (!runEvent || runEvent.type !== "run.created") throw new Error("Native parent has no imported run to own its child history.");
+  const runEvent = parentItem?.runId === undefined ? undefined : parent.events.find(event => event.type === "run.created" && event.payload.id === parentItem.runId);
+  const run = runEvent?.type === "run.created" ? runEvent.payload : undefined;
   const driver = ProviderDriverKind.make(child.conversation.driver);
   const nodeId = allocator.derive.nodeFromProviderItem({ driver, nativeItemId: `${PREFIX}:child-link:${parent.sourceKey}:${child.sourceKey}` });
   const itemId = allocator.derive.turnItemFromProviderItem({ driver, nativeItemId: `${PREFIX}:child-link:${parent.sourceKey}:${child.sourceKey}` });
   const now = at(child.conversation.updatedAt);
   const startedAt = at(child.conversation.createdAt);
+  const parentScopeId = run?.rootNodeId ?? allocator.derive.nodeFromProviderItem({ driver: ProviderDriverKind.make(parent.conversation.driver), nativeItemId: `${PREFIX}:child-scope:${parent.sourceKey}` });
+  if (!run && !parent.events.some(event => event.type === "node.updated" && event.payload.id === parentScopeId)) {
+    const scopeTime = parentThreadEvent.payload.createdAt;
+    parent.events.push(nativeEvent(parent.result.threadId, "children:scope", "node.updated", scopeTime, {
+      id: parentScopeId, threadId: parent.result.threadId, runId: null, parentNodeId: null, rootNodeId: parentScopeId,
+      kind: "system", status: "completed", countsForRun: false, providerThreadId: parent.providerThread.id, providerTurnId: null,
+      nativeItemRef: null, runtimeRequestId: null, checkpointScopeId: null, startedAt: scopeTime, completedAt: scopeTime,
+    }, { nodeId: parentScopeId, providerInstanceId: parentThreadEvent.payload.providerInstanceId }));
+  }
+  if (!run) child.result.warnings.push("Native child launch is unavailable in the selected parent history; thread lineage is preserved without inventing ownership by a parent run.");
   const status = child.conversation.turns[child.conversation.turns.length - 1]!.status;
   const prompt = child.conversation.turns.flatMap(turn => turn.items).find(item => item.kind === "user_message")?.data.text;
   const lastAssistant = child.conversation.turns.flatMap(turn => turn.items).findLast(item => item.kind === "assistant_message");
@@ -446,16 +456,16 @@ function linkChildPlan(parent: Plan, child: Plan, allocator: IdAllocator.IdAlloc
   child.events[childThreadIndex] = nativeEvent(child.result.threadId, "thread", "thread.created", startedAt, {
     ...childThread, projectId: childThreadEvent.payload.projectId, worktreePath: childThreadEvent.payload.worktreePath, branch: childThreadEvent.payload.branch, updatedAt: now, settledOverride: "settled", settledAt: now,
   }, { providerInstanceId: childThread.providerInstanceId });
-  const common = { runId: runEvent.payload.id, nodeId, providerInstanceId: childThread.providerInstanceId };
+  const common = { ...(run ? { runId: run.id } : {}), nodeId, providerInstanceId: childThread.providerInstanceId };
   const key = `child:${hash(child.sourceKey)}`;
   const nativeTaskRef = child.conversation.parent?.nativeItemId ? { driver: parent.conversation.driver, nativeId: child.conversation.parent.nativeItemId, strength: "strong" } : null;
   parent.events.push(nativeEvent(parent.result.threadId, `${key}:node`, "node.updated", now, {
-    id: nodeId, threadId: parent.result.threadId, runId: runEvent.payload.id, parentNodeId: runEvent.payload.rootNodeId, rootNodeId: runEvent.payload.rootNodeId,
+    id: nodeId, threadId: parent.result.threadId, runId: run?.id ?? null, parentNodeId: parentScopeId, rootNodeId: parentScopeId,
     kind: "subagent", status, countsForRun: false, providerThreadId: child.providerThread.id, providerTurnId: null,
     nativeItemRef: nativeTaskRef, runtimeRequestId: null, checkpointScopeId: null, startedAt, completedAt: now,
   }, common));
   const subagent = {
-    id: nodeId, threadId: parent.result.threadId, runId: runEvent.payload.id, parentNodeId: runEvent.payload.rootNodeId,
+    id: nodeId, threadId: parent.result.threadId, runId: run?.id ?? null, parentNodeId: parentScopeId,
     origin: "provider_native", createdBy: "agent", driver, providerInstanceId: childThread.providerInstanceId,
     providerThreadId: child.providerThread.id, childThreadId: child.result.threadId, nativeTaskRef,
     prompt: typeof prompt === "string" ? prompt : "", title: child.conversation.title, model: child.conversation.model ?? null,
@@ -464,8 +474,8 @@ function linkChildPlan(parent: Plan, child: Plan, allocator: IdAllocator.IdAlloc
   parent.events.push(nativeEvent(parent.result.threadId, `${key}:subagent`, "subagent.updated", now, subagent, common));
   const turnItems = parent.events.filter(event => event.type === "turn-item.updated");
   parent.events.push(nativeEvent(parent.result.threadId, `${key}:item`, "turn-item.updated", now, {
-    id: itemId, threadId: parent.result.threadId, runId: runEvent.payload.id, nodeId,
-    providerThreadId: parent.providerThread.id, providerTurnId: parentItem?.type === "turn-item.updated" ? parentItem.payload.providerTurnId : null,
+    id: itemId, threadId: parent.result.threadId, runId: run?.id ?? null, nodeId,
+    providerThreadId: parent.providerThread.id, providerTurnId: run && parentItem?.type === "turn-item.updated" ? parentItem.payload.providerTurnId : null,
     nativeItemRef: nativeTaskRef, parentItemId: parentItem?.type === "turn-item.updated" ? parentItem.payload.id : null,
     ordinal: Math.max(0, ...turnItems.map(event => event.payload.ordinal)) + 1, type: "subagent", subagentId: nodeId,
     origin: "provider_native", driver, providerInstanceId: childThread.providerInstanceId, childThreadId: child.result.threadId,

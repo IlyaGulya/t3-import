@@ -84,3 +84,34 @@ test("a real T3 server reads every page of a large imported history with models,
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("native children without a surviving launch item stay outside unrelated parent runs", { timeout: 90_000, skip: !existsSync(process.env.T3_TEST_SERVER_BINARY ?? join(homedir(), ".t3/bin/t3")) }, async () => {
+  const home = mkdtempSync(join(tmpdir(), "t3-native-orphan-lineage-"));
+  let server: Awaited<ReturnType<typeof startIsolatedT3Server>> | undefined;
+  try {
+    await initializeNativeTarget(home, 96);
+    writeFileSync(join(home, "userdata/settings.json"), JSON.stringify({ providerInstances: { codex: { driver: "codex", enabled: false } } }));
+    const at = (second: number) => new Date(Date.UTC(2026, 0, 1) + second * 1000).toISOString();
+    const source: NativeConversation = {
+      source: "codex", driver: "codex", id: "orphan-parent", nativeSessionRef: "orphan-parent", title: "Historical parent", workspace: home, active: false, warnings: [], createdAt: at(0), updatedAt: at(259205),
+      turns: [0, 20].map((offset, index) => ({ id: `turn-${index}`, status: "completed", startedAt: at(offset), completedAt: at(offset + 10), items: [
+        { id: `user-${index}`, kind: "user_message", timestamp: at(offset), status: "completed", data: { text: "Request" } },
+        { id: `tool-${index}`, kind: "command_execution", timestamp: at(offset + 1), status: "completed", data: { input: "echo done", output: "done" } },
+        { id: `answer-${index}`, kind: "assistant_message", timestamp: at(offset + 10), status: "completed", data: { text: "Answer", phase: "final_answer" } },
+      ] })),
+    };
+    source.children = [undefined, "launch-in-an-unselected-native-branch"].map((nativeItemId, index) => ({ ...source, id: `orphan-child-${index}`, nativeSessionRef: `orphan-child-${index}`, parent: { sourceId: source.id, ...(nativeItemId ? { nativeItemId } : {}) }, resumeSupported: false, createdAt: at(259200), turns: [{ ...structuredClone(source.turns[0]!), startedAt: at(259200), completedAt: at(259205), items: [
+      { id: `child-user-${index}`, kind: "user_message", timestamp: at(259200), status: "completed", data: { text: "Child request" } },
+      { id: `child-answer-${index}`, kind: "assistant_message", timestamp: at(259205), status: "completed", data: { text: "Child answer" } },
+    ] }] }));
+    const imported = await importNativeConversations([source], { t3Home: home, dryRun: false, resume: false });
+    server = await startIsolatedT3Server({ t3Home: home });
+    const { projection } = await server.request<{ projection: { runs: unknown[]; subagents: Array<{ runId: string | null; childThreadId: string | null }>; turnItems: Array<{ type: string; runId: string | null; providerTurnId: string | null }>; runtimeRequests: unknown[] } }>(`/api/orchestration/threads/${encodeURIComponent(imported.results[0]!.threadId)}`);
+    assert.equal(projection.runs.length, 2, "missing native launches do not invent a parent turn");
+    assert.equal(projection.subagents.length, 2);
+    assert.ok(projection.subagents.every(child => child.runId === null && child.childThreadId !== null), "thread lineage remains known while run ownership remains unknown");
+    assert.ok(projection.turnItems.filter(item => item.type === "subagent").every(item => item.runId === null && item.providerTurnId === null), "late child activity cannot extend an unrelated parent's work fold");
+    assert.equal(projection.runtimeRequests.length, 0);
+    assert.equal((await importNativeConversations([source], { t3Home: home, dryRun: true, resume: false })).results.every(result => result.status === "already-imported"), true);
+  } finally { await server?.stop(); rmSync(home, { recursive: true, force: true }); }
+});

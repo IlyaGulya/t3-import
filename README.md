@@ -99,6 +99,8 @@ node dist/cli.js import --source claude --workspace /path/to/project --thread SE
 
 `--source-home` selects the Claude config directory, normally `~/.claude`. Native child and grandchild histories become linked historical T3 threads. Claude's subagent history API does not supply an independent resumable session, so those children remain history-only even when root continuation is enabled.
 
+When a native child has no matching launch item in the selected parent history, its thread relationship is retained without assigning it to a guessed parent turn. Its historical activity stays outside unrelated response durations.
+
 Old Claude archives may end in an unanswered user request or unfinished tool call. The default importer rejects these indeterminate tails. To keep them deliberately as interrupted historical snapshots, use `--snapshot --no-resume`, preferably against a copied, stable Claude config directory:
 
 ```sh

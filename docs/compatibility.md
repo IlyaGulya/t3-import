@@ -14,6 +14,8 @@ Claude uses the pinned official Agent SDK history APIs, including native subagen
 
 T3 provider-turn records carry executed model provenance. Model switches inside one native user turn therefore create several terminal provider-turn sections within the same imported run and attempt. Linked subagent histories use T3's native child-thread construction and lineage contracts.
 
+Missing child-launch items do not imply ownership by the first parent run. Such children use a terminal thread-scope lineage anchor and nullable run references; their native timestamps remain intact without inflating an unrelated turn's duration.
+
 An import stores display history and references to the source runtime. The original native store is still required for resume. T3 Git checkpoints, erased provider data, encrypted/private reasoning and live child-agent execution cannot be reconstructed from a display transcript.
 
 The test suite starts no model turns. Database tests use throwaway homes and native T3 modules. A real source smoke test must use an explicit copied native home when repeatability or source isolation is required; modern Codex history can depend on its native history database as well as rollout files.
