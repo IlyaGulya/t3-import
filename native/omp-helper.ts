@@ -88,6 +88,37 @@ function taskLaunchItems(conversation: NativeConversation): Map<string, string |
     }
   return launches;
 }
+
+function moveEmptySubsessionsToMetadata(owner: NativeConversation): void {
+  if (!owner.children?.length) return;
+  owner.children = owner.children.filter((child) => {
+    moveEmptySubsessionsToMetadata(child);
+    if (
+      child.active ||
+      child.turns.length ||
+      child.children?.length ||
+      child.sourceCoverage?.selectedRecords !== 0
+    )
+      return true;
+
+    (owner.nativeMetadata ??= []).push(
+      json({
+        type: "omp_empty_subsession",
+        sourceId: child.id,
+        nativeSessionRef: child.nativeSessionRef,
+        parent: child.parent,
+        sourceCoverage: child.sourceCoverage,
+        nativeMetadata: child.nativeMetadata,
+        warnings: child.warnings,
+      }),
+    );
+    owner.warnings.push(
+      `OMP child '${child.id}' has no transcript; its native allocation is retained in parent metadata.`,
+    );
+    return false;
+  });
+}
+
 async function canonical(path: string): Promise<string> {
   try {
     return await realpath(resolve(path));
@@ -1048,6 +1079,8 @@ async function execute(request: Request): Promise<NativeSourceSummary[] | Native
       "The OMP source changed during reading; importing must wait for it to settle.",
     );
   }
+  // The final native lease check must run before omitting an empty transcript.
+  moveEmptySubsessionsToMetadata(result);
   return result;
 }
 

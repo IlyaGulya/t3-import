@@ -466,6 +466,148 @@ test(
 );
 
 test(
+  "OMP imports a family with an allocated child that has no transcript",
+  {
+    skip: skip || !existsSync(process.env.T3_TEST_SERVER_BINARY ?? join(homedir(), ".t3/bin/t3")),
+    timeout: 90_000,
+  },
+  async () => {
+    const f = await fixture(
+      [
+        message("u", null, "user", "Root question"),
+        message(
+          "call",
+          "u",
+          "assistant",
+          [
+            {
+              type: "toolCall",
+              id: "task-call",
+              name: "task",
+              arguments: {
+                tasks: [
+                  { name: "Empty", task: "Prepare" },
+                  { name: "Sibling", task: "Review" },
+                ],
+              },
+            },
+          ],
+          { stopReason: "toolUse" },
+        ),
+        message("result", "call", "toolResult", "Allocated the children", {
+          toolName: "task",
+          toolCallId: "task-call",
+          isError: false,
+          details: {
+            progress: [
+              { id: "Empty", index: 0, status: "pending" },
+              { id: "Sibling", index: 1, status: "pending" },
+            ],
+          },
+        }),
+        message("a", "result", "assistant", "Root answer"),
+      ],
+      { id: "91230000-1111-4111-8111-111111111118" },
+    );
+    const target = await mkdtemp(join(tmpdir(), "t3-omp-empty-child-"));
+    let server: Awaited<ReturnType<typeof startIsolatedT3Server>> | undefined;
+    try {
+      const directory = f.path.slice(0, -6);
+      await mkdir(directory);
+      const empty = {
+        type: "session",
+        id: "91230000-2222-4222-8222-222222222228",
+        version: 3,
+        timestamp,
+        cwd: f.workspace,
+      };
+      await writeFile(join(directory, "Empty.jsonl"), JSON.stringify(empty) + "\n");
+      await writeFile(
+        join(directory, "Sibling.jsonl"),
+        [
+          { ...empty, id: "91230000-3333-4333-8333-333333333338" },
+          message("su", null, "user", "Sibling question"),
+          message("sa", "su", "assistant", "Sibling answer"),
+        ]
+          .map((entry) => JSON.stringify(entry))
+          .join("\n") + "\n",
+      );
+      const before = await sourceTree(f.home);
+      await initializeNativeTarget(target, 96);
+      await writeFile(
+        join(target, "userdata/settings.json"),
+        JSON.stringify({ providerInstances: { pi: { driver: "pi", enabled: false } } }),
+      );
+      const cli = (...args: string[]) =>
+        JSON.parse(
+          execFileSync(process.execPath, [resolve("dist/cli.js"), ...args, "--json"], {
+            encoding: "utf8",
+            timeout: 30_000,
+          }),
+        );
+      const args = [
+        "import",
+        "--source",
+        "omp",
+        "--source-home",
+        f.home,
+        "--workspace",
+        f.workspace,
+        "--omp-package",
+        packageRoot!,
+        "--thread",
+        f.id,
+        "--t3-home",
+        target,
+        "--no-resume",
+        "--yes",
+      ];
+      const imported = cli(...args);
+      assert.equal(imported.status, "imported");
+      assert.deepEqual(
+        imported.results.map((r: { sourceId: string }) => r.sourceId),
+        [f.id, `${f.id}:agent:Sibling`],
+      );
+      const [root, sibling] = imported.results;
+      assert.match(root.warnings.join("\n"), /Empty.*no transcript/u);
+      const metadata = cli("metadata", "--t3-home", target, "--thread", root.threadId);
+      const omitted = metadata.records.find(
+        (record: { type: string }) => record.type === "omp_empty_subsession",
+      );
+      assert.equal(omitted?.sourceId, `${f.id}:agent:Empty`);
+      assert.deepEqual(omitted.parent, { sourceId: f.id, nativeItemId: "call:0" });
+      assert.deepEqual(omitted.nativeMetadata[0].header, empty);
+
+      server = await startIsolatedT3Server({ t3Home: target });
+      const { projection } = await server.request<{
+        projection: {
+          messages: Array<{ text: string }>;
+          turnItems: Array<{ id: string; toolName?: string; parentItemId: string | null }>;
+          subagents: Array<{ childThreadId: string }>;
+        };
+      }>(`/api/orchestration/threads/${encodeURIComponent(root.threadId)}`);
+      assert.deepEqual(
+        projection.messages.map((entry) => entry.text),
+        ["Root question", "Root answer"],
+      );
+      assert.ok(projection.turnItems.some((item) => item.toolName === "task"));
+      assert.deepEqual(
+        projection.subagents.map((entry) => entry.childThreadId),
+        [sibling.threadId],
+      );
+      await server.stop();
+      server = undefined;
+      assert.equal(cli(...args).status, "already-imported");
+      assert.deepEqual(await sourceTree(f.home), before);
+    } finally {
+      await server?.stop();
+      await f.close();
+      await rm(target, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
   "OMP native aborted child tails remain interrupted and malformed children cannot disappear silently",
   { skip },
   async () => {

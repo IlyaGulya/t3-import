@@ -42,6 +42,8 @@ If a very long first Claude message exceeds the SDK file-metadata sampling windo
 
 OMP uses its native `collectSubSessions`, including nested, compressed and advisor histories. Aborted snapshots stay interrupted, malformed/unreadable families fail closed, and native model/compaction/visibility behavior is reused. A child card is anchored when exactly one selected task launch result names its allocated agent ID. Child snapshots have no independent continuation binding.
 
+When an inactive OMP allocation has no transcript and no descendant history to display, its header, known launch reference and retained records go into the parent thread's native metadata. The parent's original task record remains visible.
+
 For large Claude families, unique child histories reuse the SDK's scoped store reader instead of rediscovering every file for every child. Duplicate IDs retain the SDK's global first-path selection. Private binary IPC sends individual conversations rather than creating one family-sized JavaScript string; `show --full` also streams its JSON output. The helper has a ten-minute total deadline, a 256 MiB frame budget and a 2 GiB total response budget; exceeding a limit fails before any import rather than producing truncated history. These limits apply to decoded transport data, not the source directory's size.
 
 The writer detects source fields removed or bounded by T3's typed/public representation and preserves them in importer metadata (`t3_import_preserved_fields`). Source usage/error metadata is retained when available. Codex history APIs do not expose historical token usage or per-turn model provenance; those remain explicit limitations.
