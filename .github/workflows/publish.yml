@@ -1,0 +1,78 @@
+name: Publish to npm
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the verified package to npm
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-release
+  cancel-in-progress: false
+
+jobs:
+  package:
+    if: github.repository == 'IlyaGulya/t3-import' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          repository: pingdotgg/t3code
+          ref: ea6d3fc30fb066635f31326f49b85cdee8fbf8d7
+          path: repos/t3code
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 26
+          package-manager-cache: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: bun add --global @oh-my-pi/pi-coding-agent@18.22.0
+      - run: npm ci
+      - run: npm run verify
+      - run: |
+          mkdir -p "$RUNNER_TEMP/npm-release"
+          npm pack --pack-destination "$RUNNER_TEMP/npm-release"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: ${{ runner.temp }}/npm-release/*.tgz
+          if-no-files-found: error
+
+  publish:
+    if: inputs.publish
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 26
+          package-manager-cache: false
+      - uses: actions/download-artifact@v5
+        with:
+          name: npm-package
+          path: npm-release
+      - name: Publish with npm Trusted Publishing
+        shell: bash
+        run: |
+          shopt -s nullglob
+          archives=(npm-release/ilyagulya-t3-import-*.tgz)
+          if [[ ${#archives[@]} -ne 1 ]]; then
+            echo "Expected one @ilyagulya/t3-import tarball." >&2
+            exit 1
+          fi
+          npm publish "${archives[0]}" --registry=https://registry.npmjs.org --access public --tag latest --ignore-scripts

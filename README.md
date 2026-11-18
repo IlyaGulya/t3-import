@@ -26,6 +26,12 @@ node dist/cli.js --help
 
 An existing sibling `../t3code` checkout is also detected. Set `T3_NATIVE_REFERENCE_REPO` to use another checkout. The builder rejects the wrong commit and tracked source edits so a new upstream version cannot silently change the persistence code.
 
+## Publishing
+
+The first public version requires an authenticated npm account with publish access. After it exists on npm, add a [Trusted Publisher](https://docs.npmjs.com/trusted-publishers/) in the package settings. Select GitHub Actions, owner `IlyaGulya`, repository `t3-import`, workflow `publish.yml`, and permission to run `npm publish`. Leave the environment field empty.
+
+Run **Publish to npm** from `main` in GitHub Actions. The default run verifies and packs the build. Select **Publish the verified package to npm** for a new version that should become `latest`.
+
 ## Codex
 
 List and inspect history while T3 is running:
