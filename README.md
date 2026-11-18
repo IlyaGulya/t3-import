@@ -28,9 +28,9 @@ An existing sibling `../t3code` checkout is also detected. Set `T3_NATIVE_REFERE
 
 ## Publishing
 
-The first public version requires an authenticated npm account with publish access. After it exists on npm, add a [Trusted Publisher](https://docs.npmjs.com/trusted-publishers/) in the package settings. Select GitHub Actions, owner `IlyaGulya`, repository `t3-import`, workflow `publish.yml`, and permission to run `npm publish`. Leave the environment field empty.
+To register a new package, an authenticated maintainer can [stage a release](https://docs.npmjs.com/staged-publishing/). npm creates the `0.0.0-stage` placeholder. Once the package exists, add a [Trusted Publisher](https://docs.npmjs.com/trusted-publishers/) in its npm settings. Select GitHub Actions, owner `IlyaGulya`, repository `t3-import`, workflow `publish.yml`, and permission to run `npm publish`. Leave the environment field empty.
 
-Run **Publish to npm** from `main` in GitHub Actions. The default run verifies and packs the build. Select **Publish the verified package to npm** for a new version that should become `latest`.
+Run **Publish to npm** from `main` in GitHub Actions. The default run verifies and packs the build. Select **Publish the verified package to npm** for an unused version that should become `latest`. After adding a trusted publisher, complete a successful OIDC publish within two days to validate the connection.
 
 ## Codex
 
