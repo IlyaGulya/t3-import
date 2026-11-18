@@ -3,6 +3,7 @@
   "version": "0.5.0-native.9",
   "description": "Import Codex, Claude Code and Oh My Pi history using native readers and T3 orchestration",
   "keywords": [
+    "claude-code",
     "codex",
     "conversation",
     "importer",
