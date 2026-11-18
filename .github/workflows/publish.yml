@@ -36,6 +36,15 @@ jobs:
           git init repos/t3code
           git -C repos/t3code fetch --depth=1 "$repository" "$commit"
           git -C repos/t3code checkout --detach FETCH_HEAD
+      - name: Install the pinned T3 server for integration tests
+        env:
+          T3CODE_VERSION: 0.1.11-nightly.20261117.4838
+          T3CODE_HOME: ${{ runner.temp }}/t3
+          T3CODE_INSTALL_BIN_DIR: ${{ runner.temp }}/t3/bin
+        shell: bash
+        run: |
+          sh repos/t3code/scripts/install.sh
+          echo "T3_TEST_SERVER_BINARY=$T3CODE_HOME/runtime/versions/$T3CODE_VERSION/t3" >> "$GITHUB_ENV"
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
@@ -45,6 +54,8 @@ jobs:
       - run: |
           mkdir -p "$RUNNER_TEMP/npm-release"
           npm pack --pack-destination "$RUNNER_TEMP/npm-release"
+          npm install --global --prefix "$RUNNER_TEMP/npm-smoke" "$RUNNER_TEMP"/npm-release/*.tgz
+          "$RUNNER_TEMP/npm-smoke/bin/t3-import" --version
       - uses: actions/upload-artifact@v4
         with:
           name: npm-package
@@ -72,7 +83,7 @@ jobs:
         shell: bash
         run: |
           shopt -s nullglob
-          archives=(npm-release/ilyagulya-t3-import-*.tgz)
+          archives=(./npm-release/ilyagulya-t3-import-*.tgz)
           if [[ ${#archives[@]} -ne 1 ]]; then
             echo "Expected one @ilyagulya/t3-import tarball." >&2
             exit 1
