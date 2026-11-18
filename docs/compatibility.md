@@ -10,11 +10,15 @@ The Codex reader uses `effect-codex-app-server` from that checkout. Native pagin
 
 OMP runs its own source loaders in Bun. The package's read-only entry loader, tree index, format migration, transcript builder and blob resolver remain responsible for the source format. The writable SessionManager opening path is deliberately not used. OMP package versions are checked by the helper; a different version needs native fixture validation before its support range is expanded.
 
-Claude uses the pinned official Agent SDK history APIs, including native subagent discovery and loading. The SDK's selected-chain behavior owns branch resolution. No raw transcript parser is substituted when the SDK omits system payloads. Its native timestamps, available compaction summaries and per-message model identifiers are mapped into T3; unsupported metadata is reported. Historical child snapshots without a native independent resume target are explicitly history-only.
+Claude uses the pinned official Agent SDK history APIs, including native subagent discovery and loading. The SDK's selected-chain behavior owns branch resolution. The full native history API reads scoped child stores with system records, anchored to the native child-selected head; no raw transcript parser or branch walker is substituted. Its native timestamps, available compaction summaries and per-message model identifiers are mapped into T3; unsupported metadata is reported. Historical child snapshots without a native independent resume target are explicitly history-only.
 
 T3 provider-turn records carry executed model provenance. Model switches inside one native user turn therefore create several terminal provider-turn sections within the same imported run and attempt. Linked subagent histories use T3's native child-thread construction and lineage contracts.
 
 Missing child-launch items do not imply ownership by the first parent run. Such children use a terminal thread-scope lineage anchor and nullable run references; their native timestamps remain intact without inflating an unrelated turn's duration.
+
+Claude saved compaction epochs use explicit native anchors and the SDK branch selector. A missing saved anchor is reported as a source history gap. Exact legacy task-result agent IDs can establish launch ownership; timestamps and titles cannot. Proven inherited context is retained in metadata, while native archive forks use T3 fork lineage rather than subagent cards. Child creation events are committed immediately after their proven launch events so EventSink assigns the native display positions.
+
+Claude native abort markers map to T3 interruption items, and associated partial assistant text stays interrupted. Local command envelopes are retained outside conversation turns. Missing original files are an external workspace limitation. Optional recorded workspaces contain only captured text with provenance, require `--no-resume`, and never rewrite the source directory.
 
 An import stores display history and references to the source runtime. The original native store is still required for resume. T3 Git checkpoints, erased provider data, encrypted/private reasoning and live child-agent execution cannot be reconstructed from a display transcript.
 

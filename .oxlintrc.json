@@ -1,0 +1,44 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["eslint", "typescript", "unicorn", "oxc"],
+  "jsPlugins": [
+    {
+      "name": "importer",
+      "specifier": "./quality/index.ts"
+    }
+  ],
+  "categories": {
+    "correctness": "error"
+  },
+  "rules": {
+    "eslint/no-unused-vars": [
+      "error",
+      {
+        "argsIgnorePattern": "^_",
+        "varsIgnorePattern": "^_",
+        "caughtErrorsIgnorePattern": "^_"
+      }
+    ],
+    "eslint/no-unsafe-optional-chaining": "error",
+    "eslint/no-empty-pattern": "error",
+    "eslint/no-unneeded-ternary": "error",
+    "unicorn/no-useless-spread": "error",
+    "unicorn/no-useless-fallback-in-spread": "error",
+    "oxc/no-accumulating-spread": "error",
+    "importer/require-suppression-reason": "error",
+    "importer/node-test-policy": "error"
+  },
+  "options": {
+    "typeAware": false,
+    "typeCheck": false,
+    "reportUnusedDisableDirectives": "error"
+  },
+  "ignorePatterns": [
+    "node_modules/**",
+    "repos/**",
+    "dist/**",
+    "artifacts/**",
+    "coverage/**",
+    "backups/**"
+  ]
+}

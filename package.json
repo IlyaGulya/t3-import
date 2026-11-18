@@ -1,27 +1,27 @@
 {
-  "name": "@carlosgtrz/t3-import",
-  "version": "0.5.0-native.6",
+  "name": "@ilyagulya/t3-import",
+  "version": "0.5.0-native.9",
   "description": "Import Codex, Claude Code and Oh My Pi history using native readers and T3 orchestration",
   "keywords": [
-    "t3code",
     "codex",
-    "oh-my-pi",
     "conversation",
-    "importer"
+    "importer",
+    "oh-my-pi",
+    "t3code"
   ],
+  "homepage": "https://github.com/ilyagulya/t3-import#readme",
+  "bugs": {
+    "url": "https://github.com/ilyagulya/t3-import/issues"
+  },
+  "license": "MIT",
   "author": {
     "name": "CarlosGtrz",
     "url": "https://github.com/CarlosGtrz"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/CarlosGtrz/t3-import.git"
+    "url": "git+https://github.com/ilyagulya/t3-import.git"
   },
-  "bugs": {
-    "url": "https://github.com/CarlosGtrz/t3-import/issues"
-  },
-  "homepage": "https://github.com/CarlosGtrz/t3-import#readme",
-  "type": "module",
   "bin": {
     "t3-import": "dist/cli.js",
     "t3-import-omp": "dist/omp.js"
@@ -29,23 +29,29 @@
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "docs"
   ],
+  "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "node scripts/build-native.mjs",
     "dev": "node dist/cli.js",
     "test": "node scripts/test-native.mjs",
     "typecheck": "node scripts/typecheck-native.mjs",
     "prepack": "npm run build",
-    "prepublishOnly": "npm run typecheck && npm test",
-    "release:check": "npm publish --dry-run --access public"
-  },
-  "engines": {
-    "node": ">=26"
-  },
-  "license": "MIT",
-  "publishConfig": {
-    "access": "public"
+    "prepublishOnly": "npm run verify",
+    "release:check": "npm publish --dry-run --access public",
+    "fmt": "oxfmt .",
+    "fmt:check": "oxfmt --check .",
+    "lint": "node scripts/lint.mjs",
+    "lint:architecture": "node scripts/check-architecture.mjs",
+    "test:quality": "node --test scripts/quality.test.mjs",
+    "typecheck:quality": "tsc --noEmit --strict --target ES2023 --module NodeNext --allowImportingTsExtensions --skipLibCheck quality/index.ts",
+    "verify": "node scripts/verify.mjs",
+    "verify:changed": "node scripts/verify.mjs --changed"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.321",
@@ -70,9 +76,15 @@
     "yaml": "2.9.0"
   },
   "devDependencies": {
+    "@oxlint/plugins": "1.89.0",
     "@types/bun": "1.4.4",
     "@types/node": "24.12.4",
     "esbuild": "0.28.2",
+    "oxfmt": "0.74.0",
+    "oxlint": "1.89.0",
     "typescript": "^5.9.2"
+  },
+  "engines": {
+    "node": ">=26"
   }
 }

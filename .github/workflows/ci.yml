@@ -28,9 +28,8 @@ jobs:
           bun-version: 1.4.4
       - run: bun add --global @oh-my-pi/pi-coding-agent@18.22.0
       - run: npm ci
-      - run: npm run typecheck
-      - run: npm test
+      - run: npm run verify
       - run: npm pack
       - name: Install packed artifact
         shell: bash
-        run: npm install --global ./carlosgtrz-t3-import-*.tgz && t3-import --help
+        run: npm install --global ./ilyagulya-t3-import-*.tgz && t3-import --help

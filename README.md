@@ -1,5 +1,7 @@
 # t3-import
 
+This fork of [CarlosGtrz/t3-import](https://github.com/CarlosGtrz/t3-import) uses the npm package name `@ilyagulya/t3-import`. The CLI commands are `t3-import` and `t3-import-omp`.
+
 Import rich Codex, Oh My Pi and Claude Code history into current T3 Code using the tools that own the formats:
 
 - Codex's `app-server` reads sessions, turns and items through T3's typed client.
@@ -41,7 +43,9 @@ node dist/cli.js import --source codex --workspace /path/to/project --thread SES
 node dist/cli.js import --source codex --workspace /path/to/project --thread SESSION_ID --yes
 ```
 
-Repeat `--thread` to select several sessions, or use `--all` with `--workspace`. `--since ISO_TIMESTAMP` filters by updated time. `--archived` selects archived Codex sessions. `--source-home` selects another Codex home; `--binary` selects the Codex executable. The reader pages through full native history and never starts/resumes a model turn.
+Repeat `--thread` to select several sessions, or use `--all` with `--workspace`. `--since ISO_TIMESTAMP` filters by updated time. `--source-home` selects another Codex home; `--binary` selects the Codex executable. The reader pages through full native history and never starts/resumes a model turn.
+
+Root sessions go into the normal T3 project list and stay visible when T3's automatic settlement runs. Use `--settled` to put them on the Settled shelf instead. A confirmed source archive always goes to T3 Archived, using the last source update time when the archive time is unavailable. `--archived` selects confirmed Codex archives or OMP cold archives. An explicit session ID can also find a source archive without that flag. Codex can confirm an unlisted thread from the rollout path returned by its native history API. Claude Code's SDK cannot establish archive status, so its sessions follow the normal import placement. These choices apply when creating imported threads; existing threads keep their state.
 
 ## Project grouping
 
@@ -63,7 +67,11 @@ Grouping keeps each session's original directory, including child-agent director
 
 OMP's installed source package is loaded by a small Bun helper. Its read-only loader, native tree index, format migrations and blob resolver supply the history. It does not open a writable SessionManager or launch an OMP agent.
 
+OMP's native `collectSubSessions` also supplies nested, gzip-compressed and advisor histories. These become linked historical child threads; malformed or unreadable families fail closed. Native aborted-session markers preserve interrupted tails. Cold archives created by OMP GC are discovered in `archive/sessions` and decoded with the same native parser. They are imported as history only.
+
 Turn timing ends at the native terminal response. Later idle model changes and compaction records retain their original timestamps as session activity outside that response. Displayed durations are elapsed native response times, not a measurement of billable compute or active CPU time.
+
+A new ordinary request before any assistant/tool activity supersedes the unanswered request as an interrupted historical run (`superseded_unanswered_request`). Native `steering: true` remains a steer even before work starts; later steers after actual work remain in the same run. No user-abort event is invented for a superseded request.
 
 ```sh
 node dist/cli.js list --source omp --workspace /path/to/project
@@ -89,7 +97,7 @@ Continuation also requires an absolute effective `PI_CODING_AGENT_DIR` when over
 
 ## Claude Code
 
-The pinned `@anthropic-ai/claude-agent-sdk@0.3.321` supplies `listSessions`, `getSessionInfo`, `getSessionMessages`, `listSubagents` and `getSubagentMessages`. A Node helper gives the SDK its own `CLAUDE_CONFIG_DIR`; it never starts a query or a model process.
+The pinned `@anthropic-ai/claude-agent-sdk@0.3.321` supplies `listSessions`, `getSessionInfo`, `getSessionMessages`, `importSessionToStore`, `listSubagents` and `getSubagentMessages`. A Node helper gives the SDK its own `CLAUDE_CONFIG_DIR`; it never starts a query or a model process.
 
 ```sh
 node dist/cli.js list --source claude --workspace /path/to/project
@@ -101,6 +109,10 @@ node dist/cli.js import --source claude --workspace /path/to/project --thread SE
 
 When a native child has no matching launch item in the selected parent history, its thread relationship is retained without assigning it to a guessed parent turn. Its historical activity stays outside unrelated response durations.
 
+Saved pre-compaction epochs are read through the SDK using native compaction anchors. The SDK resolves each epoch's branch; missing saved heads produce `native_history_gap` instead of invented records. Exact native task IDs link older child launches to their original tool calls. Inherited copies of parent context are preserved as metadata rather than repeated as new child work; native history forks use T3 fork lineage.
+
+Native interruption markers become T3 interruption items. A partial reply preceding an interruption remains an assistant reply with interrupted status. Local slash-command envelopes and command stdout remain metadata, preventing empty work folds and spurious user requests. Idle acknowledgements do not extend a completed response.
+
 Old Claude archives may end in an unanswered user request or unfinished tool call. The default importer rejects these indeterminate tails. To keep them deliberately as interrupted historical snapshots, use `--snapshot --no-resume`, preferably against a copied, stable Claude config directory:
 
 ```sh
@@ -109,7 +121,15 @@ node dist/cli.js import --source claude --source-home /path/to/copied-claude --w
 
 Snapshot mode preserves native IDs, contents and unfinished tool calls; it creates no continuation binding and fabricates no completed result. The flag is Claude-only and requires `--no-resume`. Root source changes detected during reading still reject the import. The native SDK has no live-process ownership probe, so snapshot mode does not claim that the original process has stopped.
 
-The SDK exposes less information than the raw store: some system records lack their payload, and it has no live-process ownership probe. Available compaction summaries and native timestamps are preserved. Missing system payloads and legacy text replies without a stop reason are reported. A stable text-only historical reply with no unfinished tool call is treated as settled; an unfinished tool tail is blocked.
+The SDK selects the conversation branch. Its official `importSessionToStore` API supplements selected record IDs with system payloads and structured tool results, one native history at a time. `turn_duration` records remain metadata; compaction boundaries become native T3 cards and merge with their summaries. Idle compaction and notices do not extend the preceding response duration. Unknown opaque records are retained as metadata with a warning; meaningful native notification text remains visible.
+
+Edit/Write/MultiEdit/NotebookEdit use T3 file-change cards, TodoWrite uses todo lists, and WebSearch/WebFetch use web-search cards. Read/search labels and MCP presentation use the pinned T3 helpers. Structured file patches and search results are preserved when supplied by the SDK; the importer does not reconstruct missing file contents from the current workspace. Complete tool input/results and selected system metadata are stored transactionally in the importer-owned `t3_native_import_metadata` table, separate from T3's typed projections. Inspect them using the destination T3 thread ID:
+
+```sh
+node dist/cli.js metadata --t3-home /path/to/isolated-t3 --thread T3_THREAD_ID --json
+```
+
+Both native store APIs are pinned, including the alpha store API. Child histories use the SDK's full history reader over a scoped native store, anchored to the child API's selected head. This restores system events and earlier messages separated by them, while the SDK continues to resolve branches and compaction. The native metadata API supplies each child's actual directory. There is no live-process ownership probe. Legacy text replies without a stop reason are reported: a stable historical reply with no unfinished tool call is treated as settled; an unfinished tool tail is blocked.
 
 Document and other non-image input blocks retain a visible reference and their complete native payload as historical tool content. T3's image attachment presentation cannot render them as native document attachments; the importer reports that limitation.
 
@@ -136,16 +156,24 @@ Codex and Claude child histories become linked T3 threads when supplied by the n
 
 Remote images are retained as references and are not downloaded. Source blobs that are missing or unsupported produce a diagnostic. Image presentation for tool variants may be limited by T3; any such omission is reported.
 
+Historical file links use their original directories. A deleted file or moved project can therefore fail to open even when the history was imported correctly. The importer does not silently redirect these paths. Optional `--restore-workspace --no-resume` materializes captured Claude text files inside the isolated T3 home's `userdata/recorded-workspaces`, with provenance and a `completeProject: false` manifest in the separate `userdata/recorded-workspace-manifests` directory. Only complete recorded writes/reads and safe edits of a known snapshot are eligible; this is a partial historical workspace, not a restored checkout. The original directory is never created or modified. This option is disabled by default.
+
 `--json` prints one JSON result on stdout. `show --full` includes the normalized conversation content, so use it only when that output is wanted. The built artifact includes the pinned T3 reference and its MIT notice.
+
+## Automatic import audit
+
+After starting the isolated target, run `t3-import audit --t3-home HOME --server http://127.0.0.1:PORT --thread DESTINATION_T3_THREAD_ID --json`. A read-only T3 access token is read from `T3_IMPORT_AUDIT_TOKEN` (or the variable selected by `--token-env`). The report compares source accounting and saved hashes against real server records, hydrated tool bodies, models, child links, project/directory identity, opaque metadata and attachment bytes. Missing/changed content fails even if counts match. `--structure-only` reports partial verification and exits nonzero. See [audit setup, exact checks and limits](docs/import-audit.md).
 
 ## Validation
 
 ```sh
-npm run typecheck
-npm test
-npm run build
+npm run fmt
+npm run verify:changed
+npm run verify
 npm pack
 ```
+
+See [quality checks](docs/quality.md) for standalone formatting/lint, architecture enforcement and deterministic regression rules, and the [browser review checklist](docs/browser-review.md) for all adapters. CI and release validation use `npm run verify`; code changes conservatively run the complete suite.
 
 Type checking checks this importer's files against actual pinned T3 source types; it does not re-check the T3 monorepo. Tests bundle native T3 modules and exercise isolated databases at every supported migration, dry-run immutability, rich history, model switches, linked children, repeat imports, conflicts, ownership locks and transaction rollback. Reader tests use the native source libraries and literal source fixtures. Codex protocol tests also use a fake app-server with T3's real client.
 

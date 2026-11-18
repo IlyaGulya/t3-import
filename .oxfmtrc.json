@@ -1,0 +1,13 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "ignorePatterns": [
+    "node_modules/**",
+    "repos/**",
+    "dist/**",
+    "artifacts/**",
+    "coverage/**",
+    "backups/**",
+    "package-lock.json",
+    "quality/LICENSE-T3"
+  ]
+}
