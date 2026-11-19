@@ -30,6 +30,8 @@ import { normalizeProjectPathForComparison } from "@t3tools/shared/path";
 import { tokenizeCliArgs } from "@t3tools/shared/cliArgs";
 import {
   DEFAULT_MODEL_BY_PROVIDER,
+  PROVIDER_SEND_TURN_MAX_FILE_BYTES,
+  PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
   OrchestrationV2DomainEvent,
   OrchestrationV2ProviderThread,
   ApplicationProjectEvent,
@@ -512,10 +514,23 @@ function imageAttachments(
       throw new Error(`Image '${image.name}' has no local content.`);
     }
     const id = `native-${hash(threadId).slice(0, 24)}-${uuid(`${item.id}:${image.id}:${hash(bytes)}`)}`;
-    assets.push({ finalPath: join(p.assets, `${id}${extension}`), bytes });
+    const finalPath = join(p.assets, `${id}${extension}`);
+    assets.push({ finalPath, bytes });
+    if (bytes.length > PROVIDER_SEND_TURN_MAX_FILE_BYTES) {
+      warnings.push(
+        `Image '${image.name}' exceeds T3's file attachment limit; the original is retained as a local asset.`,
+      );
+      references.push(`[Original image: ${finalPath}]`);
+      return [];
+    }
+    const type = bytes.length > PROVIDER_SEND_TURN_MAX_IMAGE_BYTES ? "file" : "image";
+    if (type === "file")
+      warnings.push(
+        `Image '${image.name}' exceeds T3's inline image limit and is retained as a file attachment.`,
+      );
     return [
       {
-        type: "image" as const,
+        type,
         id,
         name: basename(image.name) || `image${extension}`,
         mimeType: image.mimeType,
@@ -1153,6 +1168,7 @@ function linkChildPlan(parent: Plan, child: Plan, allocator: IdAllocator.IdAlloc
   const run = runEvent?.type === "run.created" ? runEvent.payload : undefined;
   (parent.childThreadIds ??= []).push(child.result.threadId);
   if (child.conversation.parent?.relationship === "fork") {
+    const forkNodeId = parentItem?.type === "turn-item.updated" ? parentItem.payload.nodeId : null;
     child.events[childThreadIndex] = nativeEvent(
       child.result.threadId,
       "thread",
@@ -1167,10 +1183,7 @@ function linkChildPlan(parent: Plan, child: Plan, allocator: IdAllocator.IdAlloc
           rootThreadId: parentThreadEvent.payload.lineage.rootThreadId,
           relationshipToParent: "fork",
         },
-        forkedFrom:
-          parentItem?.type === "turn-item.updated"
-            ? { type: "node", nodeId: parentItem.payload.nodeId }
-            : null,
+        forkedFrom: forkNodeId ? { type: "node", nodeId: forkNodeId } : null,
         settledOverride: "settled",
         settledAt: childThreadEvent.payload.updatedAt,
       },

@@ -348,7 +348,7 @@ export async function runNativeCli(args: string[]): Promise<void> {
     )
     .option(
       "--snapshot",
-      "Claude only: preserve unfinished historical tails as interrupted; requires --no-resume",
+      "preserve unfinished Claude or OMP history as interrupted; requires --no-resume",
     )
     .option("--dry-run", "validate and plan without writing target data")
     .option("--yes", "write the reviewed import plan")
@@ -357,8 +357,8 @@ export async function runNativeCli(args: string[]): Promise<void> {
       const ids = values.thread as string[];
       if (values.restoreWorkspace && values.resume !== false)
         throw new CliUsageError("--restore-workspace requires --no-resume.");
-      if (values.snapshot && values.source !== "claude")
-        throw new CliUsageError("--snapshot is supported only for Claude history.");
+      if (values.snapshot && values.source !== "claude" && values.source !== "omp")
+        throw new CliUsageError("--snapshot is supported only for Claude and OMP history.");
       if (values.snapshot && values.resume !== false)
         throw new CliUsageError(
           "--snapshot requires --no-resume; an incomplete snapshot cannot bind a continuation.",
@@ -424,7 +424,7 @@ export async function runNativeCli(args: string[]): Promise<void> {
     .option("--omp-package <path>", "installed OMP source package directory")
     .option("--bun-binary <command>", "Bun executable for OMP's native libraries (default: bun)")
     .option("--t3-home <path>", "T3 home (default: T3CODE_HOME or ~/.t3)")
-    .option("--snapshot", "preserve unfinished Claude history as interrupted")
+    .option("--snapshot", "preserve unfinished Claude or OMP history as interrupted")
     .option("--settled", "put non-archived imports on T3's Settled shelf")
     .option("--dry-run", "validate and plan without writing target data")
     .addOption(new Option("--yes", "write history to the stopped T3 target").conflicts("dryRun"))
@@ -452,7 +452,7 @@ export async function runNativeCli(args: string[]): Promise<void> {
               if (!json) console.error(`Checking ${source} history…`);
               const options = readOptions({
                 ...values,
-                snapshot: source === "claude" && values.snapshot,
+                snapshot: source !== "codex" && values.snapshot,
               });
               await importSourceFamilies(source, options, target.importBatch, report);
             }

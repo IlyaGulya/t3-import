@@ -13,7 +13,7 @@ import { claudeToolCard, completeClaudeToolCard } from "./claude-tools.js";
 import { sendClaudeValue, sendClaudeError } from "./claude-transport.js";
 import { realpathSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import type {
   NativeConversation,
   NativeHistoryItem,
@@ -176,31 +176,41 @@ async function historicalEpochs(
   records: SessionStoreEntry[],
   tail: SessionMessage[],
 ) {
-  const positions = new Map(
-    records.flatMap((entry, index) => (entry.uuid ? [[entry.uuid, index] as const] : [])),
-  );
+  const positions = new Map<string, number[]>();
+  for (const [index, entry] of records.entries()) {
+    if (!entry.uuid) continue;
+    const occurrences = positions.get(entry.uuid) ?? [];
+    occurrences.push(index);
+    positions.set(entry.uuid, occurrences);
+  }
+  const before = (uuid: string, limit: number) =>
+    positions.get(uuid)?.findLast((index) => index < limit);
   const epochs = [tail];
   const warnings: string[] = [];
   const visited = new Set<string>();
   let current = tail,
     ceiling = records.length;
   while (true) {
-    const boundary = current.find(
+    const boundary = current.findLast(
       (entry) =>
         !visited.has(entry.uuid) &&
-        records[positions.get(entry.uuid) ?? -1]?.subtype === "compact_boundary",
+        records[before(entry.uuid, ceiling) ?? -1]?.subtype === "compact_boundary",
     );
     if (!boundary) break;
     visited.add(boundary.uuid);
-    const boundaryIndex = positions.get(boundary.uuid)!;
+    const boundaryIndex = before(boundary.uuid, ceiling)!;
     const native = records[boundaryIndex]!;
     const anchor =
       typeof native.logicalParentUuid === "string" ? native.logicalParentUuid : undefined;
     if (!anchor || current.some((entry) => entry.uuid === anchor)) continue;
-    const anchorIndex = positions.get(anchor);
+    const anchorIndex = before(anchor, boundaryIndex);
+    if (anchorIndex === undefined && positions.has(anchor)) {
+      warnings.push(
+        `native_history_gap: compaction '${boundary.uuid}' names a saved head outside its preceding epoch; retained the SDK-selected history.`,
+      );
+      continue;
+    }
     const cut = anchorIndex === undefined ? boundaryIndex : anchorIndex + 1;
-    if (cut >= ceiling || (anchorIndex !== undefined && anchorIndex >= boundaryIndex))
-      throw new Error("Claude native compaction references contain a cycle or a future anchor.");
     ceiling = cut;
     if (anchorIndex === undefined)
       warnings.push(
@@ -747,8 +757,9 @@ async function execute(request: Request): Promise<NativeSourceSummary[] | Native
     } else info = undefined;
   }
   if (!info) throw new Error(`Claude session '${request.id}' was not found by its native SDK.`);
-  if (!info.cwd || (request.options.workspace && !samePath(info.cwd, request.options.workspace)))
+  if (info.cwd && request.options.workspace && !samePath(info.cwd, request.options.workspace))
     throw new Error("Claude session has no matching workspace.");
+  let historyInfo = info;
   const messages = await getSessionMessages(request.id, {
     ...options,
     includeSystemMessages: true,
@@ -786,6 +797,22 @@ async function execute(request: Request): Promise<NativeSourceSummary[] | Native
       currentMessages = history.messages;
       rootMessages = new Map(currentMessages.map((entry) => [entry.uuid, entry]));
       selected = new Set(currentMessages.map((entry) => entry.uuid));
+      const recoveredWorkspace = !info.cwd
+        ? childRecords.findLast(
+            (entry) =>
+              entry.uuid &&
+              selected.has(entry.uuid) &&
+              typeof entry.cwd === "string" &&
+              isAbsolute(entry.cwd),
+          )?.cwd
+        : undefined;
+      if (typeof recoveredWorkspace === "string")
+        historyInfo = { ...info, cwd: recoveredWorkspace };
+      if (
+        !historyInfo.cwd ||
+        (request.options.workspace && !samePath(historyInfo.cwd, request.options.workspace))
+      )
+        throw new Error("Claude session has no matching workspace.");
       metadata = new Map(
         childRecords
           .filter((entry) => entry.uuid && selected.has(entry.uuid))
@@ -796,12 +823,14 @@ async function execute(request: Request): Promise<NativeSourceSummary[] | Native
       );
       root = mapMessages(
         currentMessages,
-        info,
+        historyInfo,
         request.sourceHome,
         request.options.snapshot,
         metadata,
       );
       root.warnings.push(...history.warnings);
+      if (recoveredWorkspace)
+        root.warnings.push("Claude workspace recovered from its selected native history.");
     } else if (currentAgent) {
       if (!duplicateAgents.has(currentAgent)) {
         // The SDK already decoded this transcript and its sidecar. Reuse its
@@ -912,7 +941,7 @@ async function execute(request: Request): Promise<NativeSourceSummary[] | Native
         return;
       const child = mapMessages(
         currentMessages,
-        scopedInfo?.cwd ? { ...info, cwd: scopedInfo.cwd } : info,
+        scopedInfo?.cwd ? { ...historyInfo, cwd: scopedInfo.cwd } : historyInfo,
         request.sourceHome,
         request.options.snapshot,
         metadata,

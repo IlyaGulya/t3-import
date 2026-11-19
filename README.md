@@ -125,7 +125,7 @@ Old Claude archives may end in an unanswered user request or unfinished tool cal
 node dist/cli.js import --source claude --source-home /path/to/copied-claude --workspace /path/to/project --thread SESSION_ID --snapshot --no-resume --dry-run
 ```
 
-Snapshot mode preserves native IDs, contents and unfinished tool calls; it creates no continuation binding and fabricates no completed result. The flag is Claude-only and requires `--no-resume`. Root source changes detected during reading still reject the import. The native SDK has no live-process ownership probe, so snapshot mode does not claim that the original process has stopped.
+Snapshot mode preserves native IDs, contents and unfinished tool calls and creates no continuation binding. `import --snapshot` supports Claude and OMP and requires `--no-resume`. Source changes detected during reading still reject the import. Claude's SDK has no live-process ownership probe. OMP snapshots still require a confirmed absence of a live lease.
 
 The SDK selects the conversation branch. Its official `importSessionToStore` API supplements selected record IDs with system payloads and structured tool results, one native history at a time. `turn_duration` records remain metadata; compaction boundaries become native T3 cards and merge with their summaries. Idle compaction and notices do not extend the preceding response duration. Unknown opaque records are retained as metadata with a warning; meaningful native notification text remains visible.
 
@@ -160,7 +160,7 @@ Codex and Claude child histories become linked T3 threads when supplied by the n
 - Changed source history, deleted/edited target history or a native session already owned by another T3 thread produce a conflict. Incremental synchronization and replacement are not implemented in this version.
 - Resume checks the configured provider driver, enabled state and source home. OMP also requires an OMP executable. The importer does not switch providers or accounts automatically.
 
-Remote images are retained as references and are not downloaded. Source blobs that are missing or unsupported produce a diagnostic. Image presentation for tool variants may be limited by T3; any such omission is reported.
+Remote images are retained as references. Original images that exceed T3's inline limit are kept as file attachments when within the file limit, or as local assets with a reference in the history. Missing or unsupported blobs and tool image presentation limits produce diagnostics.
 
 Historical file links use their original directories. A deleted file or moved project can therefore fail to open even when the history was imported correctly. The importer does not silently redirect these paths. Optional `--restore-workspace --no-resume` materializes captured Claude text files inside the isolated T3 home's `userdata/recorded-workspaces`, with provenance and a `completeProject: false` manifest in the separate `userdata/recorded-workspace-manifests` directory. Only complete recorded writes/reads and safe edits of a known snapshot are eligible; this is a partial historical workspace, not a restored checkout. The original directory is never created or modified. This option is disabled by default.
 
@@ -176,7 +176,7 @@ node dist/cli.js import-all --dry-run --snapshot
 node dist/cli.js import-all --yes --snapshot
 ```
 
-`--snapshot` preserves unfinished Claude tails as interrupted history. `--dry-run` can run alongside T3. It reads and validates the selected history without writing. `--yes` checks that T3 is stopped, acquires its ownership lock and checks the database schema and integrity before opening any source reader. It holds the lock until the run ends. The first batch that writes creates one verified SQLite backup for the run. Dry runs and runs with nothing new to write create no backup.
+`--snapshot` preserves unfinished Claude tails and OMP tails without a live lease as interrupted history. `--dry-run` can run alongside T3. It reads and validates the selected history without writing. `--yes` checks that T3 is stopped, acquires its ownership lock and checks the database schema and integrity before opening any source reader. It holds the lock until the run ends. The first batch that writes creates one verified SQLite backup for the run. Dry runs and runs with nothing new to write create no backup.
 
 Source errors and rejected families are listed under `failures` and produce a nonzero exit status. Independent families can still import. Unexpected target errors stop the run and report the backup path if one was created. After resolving the reported problem, rerun the same command. A committed, unchanged family reports `already-imported`. Conflicts leave existing history intact. The SQLite backup covers the database. For a full rollback that also restores settings and attachments, make a separate copy of `userdata` with T3 stopped before applying.
 

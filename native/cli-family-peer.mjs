@@ -38,7 +38,16 @@ const thread = (id) => ({
   turns: [],
 });
 const items = (id) => [
-  { id: `${id}-user`, type: "userMessage", content: [{ type: "text", text: "Synthetic request" }] },
+  {
+    id: `${id}-user`,
+    type: "userMessage",
+    content: [
+      { type: "text", text: "Synthetic request" },
+      ...(id === "archived-root" && existsSync(join(process.env.CODEX_HOME, "large.png"))
+        ? [{ type: "localImage", path: join(process.env.CODEX_HOME, "large.png") }]
+        : []),
+    ],
+  },
   ...(id === "family-root"
     ? [
         {

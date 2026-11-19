@@ -78,6 +78,65 @@ function cli(...args: string[]) {
   );
 }
 
+test("Claude recovers a missing workspace from a selected native history record", () => {
+  const f = fixture();
+  try {
+    f.write([
+      {
+        ...f.record("title", null, "custom-title", undefined),
+        cwd: undefined,
+        customTitle: "Workspace fallback fixture",
+      },
+      {
+        ...f.record("first", null, "user", {
+          role: "user",
+          content: "Original request ".repeat(5000),
+        }),
+        cwd: undefined,
+      },
+      f.record("recorded", "first", "assistant", {
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        stop_reason: "end_turn",
+        content: [{ type: "text", text: "Recorded workspace" }],
+      }),
+      {
+        ...f.record("last-user", "recorded", "user", {
+          role: "user",
+          content: "More text ".repeat(20_000),
+        }),
+        cwd: undefined,
+      },
+      {
+        ...f.record("last-answer", "last-user", "assistant", {
+          role: "assistant",
+          model: "claude-sonnet-4-6",
+          stop_reason: "end_turn",
+          content: [{ type: "text", text: "Final reply".repeat(20_000) }],
+        }),
+        cwd: undefined,
+      },
+    ]);
+    const shown = cli(
+      "show",
+      "--source",
+      "claude",
+      "--source-home",
+      f.home,
+      "--thread",
+      sessionId,
+      "--full",
+      "--json",
+    );
+    assert.equal(shown.status, 0, shown.stdout + shown.stderr);
+    const result = JSON.parse(shown.stdout);
+    assert.equal(result.workspace, f.workspace);
+    assert.match(result.warnings.join(" "), /workspace.*selected native history/i);
+  } finally {
+    rmSync(f.home, { recursive: true, force: true });
+  }
+});
+
 test("Claude history is readable through the CLI using its native selected conversation", () => {
   const f = fixture();
   try {
@@ -1690,11 +1749,11 @@ test(
   },
 );
 
-test("Claude snapshot requires history-only mode and cannot be applied to another native harness", () => {
+test("snapshot requires history-only mode and rejects Codex before launching a reader", () => {
   for (const args of [
     ["--source", "claude", "--snapshot"],
     ["--source", "codex", "--snapshot", "--no-resume"],
-    ["--source", "omp", "--snapshot", "--no-resume"],
+    ["--source", "omp", "--snapshot"],
   ]) {
     const result = cli(
       "import",
@@ -2241,6 +2300,12 @@ test(
           }),
           isCompactSummary: true,
         },
+        f.record("before-answer", "abandoned", "assistant", {
+          role: "assistant",
+          model: "claude-opus-4-6",
+          stop_reason: "end_turn",
+          content: [{ type: "text", text: "Duplicate UUID on an abandoned branch" }],
+        }),
         f.record("after-user", "summary-two", "user", {
           role: "user",
           content: "After both compactions",
@@ -2349,6 +2414,22 @@ test(
         stop_reason: "end_turn",
         content: [{ type: "text", text: "Original answer" }],
       }),
+      {
+        ...f.record("idle-boundary", "root-answer", "system", undefined),
+        logicalParentUuid: "root-answer",
+        subtype: "compact_boundary",
+        compactMetadata: { trigger: "auto", preTokens: 10 },
+        timestamp: "2026-01-01T00:00:01.000Z",
+        content: "Conversation compacted",
+      },
+      {
+        ...f.record("idle-summary", "idle-boundary", "user", {
+          role: "user",
+          content: "Saved context",
+        }),
+        isCompactSummary: true,
+        timestamp: "2026-01-01T00:00:01.000Z",
+      },
     ];
     try {
       f.write(copied);
@@ -2360,18 +2441,26 @@ test(
           ...copied.map((entry) =>
             entry.uuid === "root-user"
               ? { ...entry, uuid: "rewritten-user" }
-              : { ...entry, parentUuid: "rewritten-user" },
+              : entry.uuid === "root-answer"
+                ? { ...entry, parentUuid: "rewritten-user" }
+                : entry,
           ),
-          f.record("fork-user", "root-answer", "user", {
-            role: "user",
-            content: "Summarize inherited context",
-          }),
-          f.record("fork-answer", "fork-user", "assistant", {
-            role: "assistant",
-            model: "claude-haiku-4-5",
-            stop_reason: "end_turn",
-            content: [{ type: "text", text: "Saved summary" }],
-          }),
+          {
+            ...f.record("fork-user", "idle-summary", "user", {
+              role: "user",
+              content: "Summarize inherited context",
+            }),
+            timestamp: "2026-01-01T00:00:02.000Z",
+          },
+          {
+            ...f.record("fork-answer", "fork-user", "assistant", {
+              role: "assistant",
+              model: "claude-haiku-4-5",
+              stop_reason: "end_turn",
+              content: [{ type: "text", text: "Saved summary" }],
+            }),
+            timestamp: "2026-01-01T00:00:03.000Z",
+          },
         ]
           .map((entry) => JSON.stringify({ ...entry, isSidechain: true }))
           .join("\n") + "\n",
@@ -2407,12 +2496,16 @@ test(
         projection: c,
       }: {
         projection: {
-          thread: { lineage: { relationshipToParent: string; parentThreadId: string } };
+          thread: {
+            forkedFrom: unknown;
+            lineage: { relationshipToParent: string; parentThreadId: string };
+          };
           messages: { text: string }[];
         };
       } = await server.request(`/api/orchestration/threads/${encodeURIComponent(child.threadId)}`);
       assert.equal(c.thread.lineage.relationshipToParent, "fork");
       assert.equal(c.thread.lineage.parentThreadId, parent.threadId);
+      assert.equal(c.thread.forkedFrom, null);
       assert.deepEqual(
         c.messages.map((message) => message.text),
         ["Summarize inherited context", "Saved summary"],

@@ -4,6 +4,7 @@ import { access, readFile, realpath, stat } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
+import { writeNativeJson } from "./json-output.js";
 import type {
   NativeConversation,
   NativeHistoryItem,
@@ -26,6 +27,7 @@ import type * as Manager from "@oh-my-pi/pi-coding-agent/session/session-manager
 import type * as Context from "@oh-my-pi/pi-coding-agent/session/session-context";
 import type * as Blobs from "@oh-my-pi/pi-coding-agent/session/blob-store";
 import type * as SubSessions from "@oh-my-pi/pi-coding-agent/session/sub-sessions";
+import type * as SelectiveCommit from "@oh-my-pi/pi-coding-agent/commit/selective/journal";
 import type * as Exit from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
 import type * as Dirs from "@oh-my-pi/pi-utils/dirs";
 import type * as Logger from "@oh-my-pi/pi-utils/logger";
@@ -709,7 +711,24 @@ async function execute(request: Request): Promise<NativeSourceSummary[] | Native
               }),
             );
             call.status = status;
-            call.completedAt = iso(entry.timestamp, baseAt);
+            const completedAt = iso(entry.timestamp, baseAt);
+            if (call.startedAt && Date.parse(completedAt) < Date.parse(call.startedAt)) {
+              nativeMetadata.push(
+                json({
+                  type: "omp_tool_clock_skew",
+                  uuid: entry.id,
+                  mappedItemId: call.id,
+                  startedAt: call.startedAt,
+                  completedAt,
+                }),
+              );
+              delete call.startedAt;
+              warnings.add(
+                `OMP tool '${call.id}' ends before it starts; both native timestamps were retained in metadata.`,
+              );
+            } else {
+              call.completedAt = completedAt;
+            }
             call.data.output =
               call.kind === "command_execution"
                 ? output
@@ -726,7 +745,8 @@ async function execute(request: Request): Promise<NativeSourceSummary[] | Native
             if (message.isError) call.data.outputIndicatesFailure = true;
             const attached = images(message.content, entry.id);
             if (attached.length) call.images = [...(call.images || []), ...attached];
-            current!.completedAt = iso(entry.timestamp, current!.completedAt);
+            if (Date.parse(completedAt) >= Date.parse(current!.completedAt))
+              current!.completedAt = completedAt;
           } else {
             warnings.add(
               "An OMP tool result has no initiating call in the selected branch; its complete content was retained.",
@@ -896,6 +916,7 @@ async function execute(request: Request): Promise<NativeSourceSummary[] | Native
     const closedTail =
       aborted || source.archived === true || exit.sessionExitFollowsLastMessage(branch);
     const incompleteTail = Boolean(current && !settled);
+    const snapshotTail = request.options.snapshot === true && incompleteTail && !closedTail;
     if (incompleteTail) {
       current!.status = "interrupted";
       warnings.add(
@@ -903,7 +924,9 @@ async function execute(request: Request): Promise<NativeSourceSummary[] | Native
           ? "The OMP cold archive contains an unfinished last turn; the tail is preserved as interrupted."
           : closedTail
             ? "OMP recorded a process exit before completing its last turn; the tail is preserved as interrupted."
-            : "The OMP session ends in an incomplete turn without a native process-exit marker; importing must wait for a settled source.",
+            : snapshotTail
+              ? "The OMP snapshot preserves the unfinished native tail as interrupted history without a continuation."
+              : "The OMP session ends in an incomplete turn without a native process-exit marker; importing must wait for a settled source.",
       );
     }
     if (pending.length)
@@ -912,7 +935,10 @@ async function execute(request: Request): Promise<NativeSourceSummary[] | Native
       );
 
     const leaseAfter = storageModule.isSessionLeaseHeld(header.id);
-    const active = leaseBefore !== false || leaseAfter !== false || (incompleteTail && !closedTail);
+    const active =
+      leaseBefore !== false ||
+      leaseAfter !== false ||
+      (incompleteTail && !closedTail && !snapshotTail);
     if (leaseBefore !== false || leaseAfter !== false)
       warnings.add(
         "OMP's native session ownership probe reports a live owner or an unknown lease; importing must wait.",
@@ -934,6 +960,7 @@ async function execute(request: Request): Promise<NativeSourceSummary[] | Native
       ...(model ? { model } : {}),
       sourceHome: agentDir,
       nativeSessionRef: sourcePath,
+      ...(snapshotTail ? { resumeSupported: false } : {}),
       driver: "pi",
       nativeMetadata,
       sourceCoverage: {
@@ -969,16 +996,41 @@ async function execute(request: Request): Promise<NativeSourceSummary[] | Native
   }
   const result = await normalizeHistory(loaded.entries, source, path);
   if (compressed) result.resumeSupported = false;
-  const collect = () =>
-    subSessions.collectSubSessions(path, {
+  const collect = async () => {
+    let needsJournalCheck = false;
+    const records = await subSessions.collectSubSessions(path, {
       includeCompressed: true,
       includeAdvisors: true,
       onUnreadable(key) {
+        if (key === "changes") {
+          needsJournalCheck = true;
+          return;
+        }
         throw new Error(
           `OMP native child '${key}' has an unreadable session header; refusing partial family history.`,
         );
       },
     });
+    if (needsJournalCheck) {
+      const { ChangeJournal } = (await import(
+        pathToFileURL(join(request.packageRoot, "src/commit/selective/journal.ts")).href
+      )) as typeof SelectiveCommit;
+      const journal = await ChangeJournal.at(path.slice(0, compressed ? -9 : -6)).read();
+      if (
+        journal.length === 0 ||
+        !journal.every(
+          (entry) =>
+            entry &&
+            typeof entry.agent === "string" &&
+            ["change", "call", "commit"].includes(entry.type),
+        )
+      )
+        throw new Error(
+          "OMP native child 'changes' has an unreadable session header and is not a native change journal.",
+        );
+    }
+    return records;
+  };
   const signature = (records: Record<string, SubSessions.SubSession>): string => {
     const digest = createHash("sha256");
     for (const [key, record] of Object.entries(records).sort(([a], [b]) => a.localeCompare(b)))
@@ -1090,7 +1142,7 @@ console.log = (...values) => console.error(...values);
 try {
   const input = await Bun.stdin.text();
   const value = await execute(JSON.parse(input));
-  process.stdout.write(JSON.stringify({ ok: true, value }));
+  await writeNativeJson({ ok: true, value }, false);
 } catch (error) {
   process.stdout.write(
     JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }),

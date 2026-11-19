@@ -6,6 +6,7 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { JSONParser } from "@streamparser/json";
 import type {
   NativeConversation,
   NativeReadOptions,
@@ -16,7 +17,7 @@ import type {
 const PACKAGE = "@oh-my-pi/pi-coding-agent";
 const PACKAGE_VERSION = "18.22.0";
 const exec = promisify(execFile);
-const MAX_HELPER_BYTES = 512 * 1024 * 1024;
+const MAX_HELPER_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_STDERR_BYTES = 16 * 1024;
 
 interface OmpReaderDependencies {
@@ -199,7 +200,11 @@ export function createOmpReader(dependencies: OmpReaderDependencies = {}): Nativ
     });
     children.add(child);
     const result = new Promise<unknown>((accept, reject) => {
-      const chunks: Buffer[] = [];
+      const parser = new JSONParser({ paths: ["$"], stringBufferSize: 64 * 1024 });
+      let reply: { ok?: unknown; value?: unknown; error?: unknown } | undefined;
+      parser.onValue = ({ value }) => {
+        if (value && typeof value === "object" && !Array.isArray(value)) reply = value;
+      };
       let size = 0;
       let stderr = "";
       let failure: Error | undefined;
@@ -208,13 +213,22 @@ export function createOmpReader(dependencies: OmpReaderDependencies = {}): Nativ
         stopChild(child);
       }, 120_000);
       child.stdout.on("data", (chunk: Buffer) => {
+        if (failure) return;
+        timer.refresh();
         size += chunk.length;
         if (size > MAX_HELPER_BYTES) {
           failure = new Error(
-            "OMP history exceeds the 512 MiB helper transport budget; no partial history was imported.",
+            "OMP history exceeds the 2 GiB helper transport budget; no partial history was imported.",
           );
           stopChild(child);
-        } else chunks.push(chunk);
+          return;
+        }
+        try {
+          parser.write(chunk);
+        } catch (error) {
+          failure = new Error("OMP helper returned invalid JSON.", { cause: error });
+          stopChild(child);
+        }
       });
       child.stderr.on("data", (chunk: Buffer) => {
         stderr = (stderr + chunk.toString("utf8")).slice(-MAX_STDERR_BYTES);
@@ -239,15 +253,11 @@ export function createOmpReader(dependencies: OmpReaderDependencies = {}): Nativ
             ),
           );
         try {
-          const reply = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
-            ok?: unknown;
-            value?: unknown;
-            error?: unknown;
-          };
-          if (reply.ok !== true)
+          if (!parser.isEnded) parser.end();
+          if (reply?.ok !== true)
             return reject(
               new Error(
-                typeof reply.error === "string"
+                typeof reply?.error === "string"
                   ? reply.error
                   : "OMP helper returned an invalid response.",
               ),

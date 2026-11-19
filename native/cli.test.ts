@@ -1,5 +1,13 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -154,6 +162,8 @@ test(
     try {
       mkdirSync(join(source, "workspace"), { recursive: true });
       writeFileSync(join(source, "bulk"), "");
+      const image = Buffer.alloc(10 * 1024 * 1024 + 1, 42);
+      writeFileSync(join(source, "large.png"), image);
       await initializeNativeTarget(target, 96);
       const preview = cli(...flags, "--dry-run");
       assert.equal(preview.status, 0, preview.stdout + preview.stderr);
@@ -180,6 +190,7 @@ test(
       try {
         type Snapshot = {
           projection: {
+            messages: { attachments: { id: string; type: string; sizeBytes: number }[] }[];
             thread: {
               projectId: string;
               archivedAt: string | null;
@@ -198,6 +209,15 @@ test(
         assert.equal(child!.lineage.parentThreadId, threads.get("family-root"));
         assert.ok(archived!.archivedAt);
         assert.notEqual(root!.projectId, archived!.projectId);
+        const attachment = snapshots[2]!.projection.messages.flatMap(
+          (message) => message.attachments,
+        )[0]!;
+        assert.equal(attachment.type, "file");
+        assert.equal(attachment.sizeBytes, image.length);
+        assert.deepEqual(
+          readFileSync(join(target, "userdata", "attachments", `${attachment.id}.png`)),
+          image,
+        );
       } finally {
         await server.stop();
       }

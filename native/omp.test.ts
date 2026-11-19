@@ -514,6 +514,18 @@ test(
     try {
       const directory = f.path.slice(0, -6);
       await mkdir(directory);
+      await writeFile(
+        join(directory, "changes.jsonl"),
+        JSON.stringify({
+          type: "change",
+          at: Date.parse(timestamp),
+          agent: "Main",
+          tool: "edit",
+          path: join(f.workspace, "example.txt"),
+          before: null,
+          after: null,
+        }) + "\n",
+      );
       const empty = {
         type: "session",
         id: "91230000-2222-4222-8222-222222222228",
@@ -615,6 +627,7 @@ test(
       message("ru", null, "user", "Root request"),
       message("ra", "ru", "assistant", "Root answer"),
     ]);
+    const target = await mkdtemp(join(tmpdir(), "t3-omp-snapshot-tail-"));
     try {
       const directory = f.path.slice(0, -6);
       await mkdir(directory);
@@ -651,6 +664,35 @@ test(
       );
       const active = await f.reader.read(f.id, f.options);
       assert.equal(active.children?.[0]?.active, true);
+      await initializeNativeTarget(target, 96);
+      const preview = JSON.parse(
+        execFileSync(
+          process.execPath,
+          [
+            resolve(process.env.T3_IMPORTER_TEST_CLI || "dist/cli.js"),
+            "import-all",
+            "--source",
+            "omp",
+            "--source-home",
+            f.home,
+            "--omp-package",
+            packageRoot!,
+            "--t3-home",
+            target,
+            "--dry-run",
+            "--snapshot",
+            "--json",
+          ],
+          { encoding: "utf8", timeout: 30_000 },
+        ),
+      );
+      assert.equal(preview.results.length, 2);
+      assert.match(
+        preview.results
+          .find((row: { sourceId: string }) => row.sourceId.endsWith(":agent:Killed"))
+          .warnings.join(" "),
+        /snapshot.*interrupted/i,
+      );
       await writeFile(`${childPath}.tombstone`, "native kill marker");
       const before = await sourceTree(f.home);
       const aborted = await f.reader.read(f.id, f.options);
@@ -679,6 +721,7 @@ test(
       );
     } finally {
       await f.close();
+      await rm(target, { recursive: true, force: true });
     }
   },
 );
@@ -733,7 +776,7 @@ test(
             toolName: "bash",
             isError: false,
           }),
-          64,
+          61,
         ),
         timed(message("answer", "result", "assistant", "Answer after actual work"), 65),
         timed(message("next", "answer", "user", "Next request"), 70),
@@ -797,6 +840,23 @@ test(
           ),
         );
       const imported = cli(...args);
+      assert.match(imported.results[0].warnings.join(" "), /tool.*end.*before.*start/i);
+      assert.deepEqual(
+        history.nativeMetadata!.find(
+          (entry) =>
+            entry &&
+            typeof entry === "object" &&
+            !Array.isArray(entry) &&
+            entry.type === "omp_tool_clock_skew",
+        ),
+        {
+          type: "omp_tool_clock_skew",
+          uuid: "result",
+          mappedItemId: "call:0",
+          startedAt: at(62),
+          completedAt: at(61),
+        },
+      );
       assert.equal(cli(...args).results[0].status, "already-imported");
       server = await startIsolatedT3Server({ t3Home: target });
       const { projection } = await server.request<{
