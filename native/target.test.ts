@@ -39,7 +39,9 @@ test(
   "recorded workspace provenance does not overwrite a captured project manifest",
   { timeout: 90_000 },
   async () => {
-    const sourceHome = realpathSync(mkdtempSync(join(tmpdir(), "t3-recorded-manifest-source-")));
+    const sourceHome = realpathSync.native(
+      mkdtempSync(join(tmpdir(), "t3-recorded-manifest-source-")),
+    );
     const targetHome = mkdtempSync(join(tmpdir(), "t3-recorded-manifest-target-"));
     let server: Awaited<ReturnType<typeof startIsolatedT3Server>> | undefined;
     try {
@@ -409,7 +411,7 @@ for (const migration of [96, 97, 98])
         assert.equal(runtime.provider_name, "codex");
         assert.equal(runtime.status, "stopped");
         const project = db.prepare("SELECT workspace_root FROM projection_projects").get()!;
-        assert.equal(project.workspace_root, input.workspace);
+        assert.equal(project.workspace_root, resolve(input.workspace));
       });
       assert.equal(
         readdirSync(join(home, "userdata", "attachments")).filter((file) => file.endsWith(".png"))
@@ -731,10 +733,18 @@ test("missing historical message and tool images retain references without abort
     assert.equal(result.status, "imported");
     assert.match(JSON.stringify(result), /unavailable/);
     sqlRead(home, (db) => {
-      const events = JSON.stringify(db.prepare("SELECT * FROM orchestration_events").all());
-      assert.ok(events.includes("Unavailable image:"));
-      assert.ok(events.includes("importedImageReferences"));
-      assert.ok(events.includes(missing));
+      const payloads = db
+        .prepare(
+          "SELECT payload_json FROM orchestration_events WHERE event_type IN ('message.updated', 'turn-item.updated')",
+        )
+        .all()
+        .map((row) => JSON.parse(String(row.payload_json)));
+      const reference = `[Unavailable image: ${missing}]`;
+      assert.ok(payloads.some((item) => item.text?.includes(reference)));
+      assert.deepEqual(
+        payloads.find((item) => item.type === "dynamic_tool")?.output.importedImageReferences,
+        [reference],
+      );
     });
     assert.equal(count(home, "orchestration_v2_projection_runs"), 2);
   } finally {

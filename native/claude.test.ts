@@ -22,7 +22,8 @@ import { startIsolatedT3Server } from "./server.ts";
 const sessionId = "91a30000-1111-4111-8111-111111111111";
 const timestamp = "2026-01-01T00:00:00.000Z";
 function fixture() {
-  const home = realpathSync(mkdtempSync(join(tmpdir(), "t3-native-claude-")));
+  // The SDK resolves workspace paths through native realpath, including Windows short names.
+  const home = realpathSync.native(mkdtempSync(join(tmpdir(), "t3-native-claude-")));
   const workspace = join(home, "workspace");
   mkdirSync(workspace);
   const directory = join(home, "projects", workspace.replace(/[^a-zA-Z0-9]/g, "-"));
@@ -2592,8 +2593,12 @@ test(
       assert.equal(file.contents, contents);
       assert.equal(file.truncated, false);
       const provenance = cli("metadata", "--t3-home", target, "--thread", threadId, "--json");
+      assert.equal(provenance.status, 0, provenance.stdout + provenance.stderr);
       assert.ok(
-        provenance.stdout.includes(f.workspace) && provenance.stdout.includes("recorded_workspace"),
+        JSON.parse(provenance.stdout).records.some(
+          (record: { type: string; sourceWorkspace?: string }) =>
+            record.type === "recorded_workspace" && record.sourceWorkspace === f.workspace,
+        ),
       );
       assert.equal(
         existsSync(f.workspace),
