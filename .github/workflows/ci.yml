@@ -12,6 +12,10 @@ jobs:
         os: [windows-latest, macos-latest, ubuntu-latest]
         node: [26]
     runs-on: ${{ matrix.os }}
+    env:
+      T3CODE_VERSION: 0.1.11-nightly.20261117.4838
+      T3CODE_HOME: ${{ runner.temp }}/t3
+      T3CODE_INSTALL_BIN_DIR: ${{ runner.temp }}/t3/bin
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -23,6 +27,19 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
+      - name: Install the pinned T3 server on Linux and macOS
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          sh repos/t3code/scripts/install.sh
+          echo "T3_TEST_SERVER_BINARY=$T3CODE_HOME/runtime/versions/$T3CODE_VERSION/t3" >> "$GITHUB_ENV"
+      - name: Install the pinned T3 server on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./repos/t3code/scripts/install.ps1
+          $binary = Join-Path $env:T3CODE_HOME "runtime/versions/$env:T3CODE_VERSION/t3.exe"
+          "T3_TEST_SERVER_BINARY=$binary" >> $env:GITHUB_ENV
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
