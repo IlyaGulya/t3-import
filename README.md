@@ -73,7 +73,9 @@ Grouping keeps each session's original directory, including child-agent director
 
 OMP's installed source package is loaded by a small Bun helper. Its read-only loader, native tree index, format migrations and blob resolver supply the history. It does not open a writable SessionManager or launch an OMP agent.
 
-OMP's native `collectSubSessions` also supplies nested, gzip-compressed and advisor histories. These become linked historical child threads; malformed or unreadable families fail closed. Native aborted-session markers preserve interrupted tails. Cold archives created by OMP GC are discovered in `archive/sessions` and decoded with the same native parser. They are imported as history only.
+Nested, gzip-compressed and advisor histories follow OMP's native export layout and are decoded one transcript at a time by the installed OMP package. They become linked historical child threads. Malformed or changing families fail closed, and native aborted-session markers preserve interrupted tails. Cold archives created by OMP GC in `archive/sessions` are imported as history only.
+
+OMP history is streamed in individual records and staged in private temporary storage. The whole family has no transport byte limit. Each helper record is limited to 256 MiB. T3 writes use batches inside one transaction for the family. Dry-run stages and validates the history without writing to the target.
 
 Turn timing ends at the native terminal response. Later idle model changes and compaction records retain their original timestamps as session activity outside that response. Displayed durations are elapsed native response times, not a measurement of billable compute or active CPU time.
 

@@ -466,12 +466,103 @@ test(
 );
 
 test(
+  "OMP streams a turn and family larger than the CLI heap without changing its source or T3 target",
+  { skip, timeout: 90_000 },
+  async () => {
+    const body = "streamed history content ".repeat(90_000);
+    const rootItems = 64;
+    const f = await fixture(
+      [
+        message("u", null, "user", "Root"),
+        ...Array.from({ length: rootItems }, (_, index) =>
+          message(
+            `part-${index}`,
+            index ? `part-${index - 1}` : "u",
+            "assistant",
+            [{ type: "thinking", thinking: body }],
+            { stopReason: "toolUse" },
+          ),
+        ),
+        message("a", `part-${rootItems - 1}`, "assistant", "Done"),
+      ],
+      { id: "91230000-1111-4111-8111-111111111119" },
+    );
+    const target = await mkdtemp(join(tmpdir(), "t3-omp-stream-"));
+    try {
+      const directory = f.path.slice(0, -6);
+      await mkdir(directory);
+      const childCount = 16;
+      for (let index = 0; index < childCount; index++) {
+        const header = {
+          type: "session",
+          id: `91230000-2222-4222-8222-${String(index).padStart(12, "0")}`,
+          version: 3,
+          timestamp,
+          cwd: f.workspace,
+        };
+        await writeFile(
+          join(directory, `child-${index}.jsonl`),
+          [header, message("u", null, "user", "Child"), message("a", "u", "assistant", body)]
+            .map((entry) => JSON.stringify(entry))
+            .join("\n") + "\n",
+        );
+      }
+      const before = await sourceTree(f.home);
+      await initializeNativeTarget(target, 96);
+      const database = join(target, "userdata/statev2.sqlite");
+      const beforeDatabase = await hash(database);
+      const result = JSON.parse(
+        execFileSync(
+          process.execPath,
+          [
+            "--max-old-space-size=128",
+            resolve(process.env.T3_IMPORTER_TEST_CLI || "dist/cli.js"),
+            "import",
+            "--source",
+            "omp",
+            "--source-home",
+            f.home,
+            "--omp-package",
+            packageRoot!,
+            "--workspace",
+            f.workspace,
+            "--thread",
+            f.path,
+            "--t3-home",
+            target,
+            "--no-resume",
+            "--dry-run",
+            "--json",
+          ],
+          { encoding: "utf8", timeout: 80_000, stdio: ["ignore", "pipe", "pipe"] },
+        ),
+      );
+      assert.equal(result.status, "dry-run");
+      assert.equal(result.backup, null);
+      assert.equal(result.results.length, childCount + 1);
+      assert.ok(result.results.every((row: { messages: number }) => row.messages === 2));
+      assert.equal(result.results[0].turns, 1);
+      assert.equal(result.results[0].items, rootItems + 2);
+      assert.equal(await hash(database), beforeDatabase);
+      assert.deepEqual(await sourceTree(f.home), before);
+    } finally {
+      await f.close();
+      await rm(target, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
   "OMP imports a family with an allocated child that has no transcript",
   {
     skip: skip || !existsSync(process.env.T3_TEST_SERVER_BINARY ?? join(homedir(), ".t3/bin/t3")),
     timeout: 90_000,
   },
   async () => {
+    const reasoning = Array.from({ length: 270 }, (_, index) => ({
+      type: "thinking",
+      thinking: `Reasoning step ${index}`,
+    }));
     const f = await fixture(
       [
         message("u", null, "user", "Root question"),
@@ -480,6 +571,7 @@ test(
           "u",
           "assistant",
           [
+            ...reasoning,
             {
               type: "toolCall",
               id: "task-call",
@@ -572,9 +664,40 @@ test(
         "--t3-home",
         target,
         "--no-resume",
-        "--yes",
       ];
-      const imported = cli(...args);
+      const planned = cli(...args, "--dry-run");
+      const [rootPlan, childPlan] = planned.results;
+      assert.equal(childPlan.sourceId, `${f.id}:agent:Sibling`);
+      const db = new DatabaseSync(join(target, "userdata/statev2.sqlite"));
+      try {
+        // Abort only after the parent's events are visible inside the uncommitted transaction.
+        db.exec(`
+          CREATE TRIGGER fail_native_child BEFORE INSERT ON orchestration_events
+          WHEN NEW.stream_id = '${childPlan.threadId}' AND EXISTS (
+            SELECT 1 FROM orchestration_events WHERE stream_id = '${rootPlan.threadId}'
+          )
+          BEGIN SELECT RAISE(ABORT, 'fixture interrupted family write'); END;
+        `);
+        assert.throws(
+          () => cli(...args, "--yes"),
+          (error: unknown) => {
+            const failure = error as { status?: number; stdout?: string };
+            return failure.status === 6 && JSON.parse(failure.stdout ?? "{}").status === "error";
+          },
+        );
+        assert.deepEqual(
+          db.prepare("SELECT DISTINCT stream_id FROM orchestration_events").all(),
+          [],
+        );
+        assert.equal(
+          db.prepare("SELECT 1 FROM sqlite_master WHERE name = 't3_native_imports'").get(),
+          undefined,
+        );
+      } finally {
+        db.exec("DROP TRIGGER IF EXISTS fail_native_child");
+        db.close();
+      }
+      const imported = cli(...args, "--yes");
       assert.equal(imported.status, "imported");
       assert.deepEqual(
         imported.results.map((r: { sourceId: string }) => r.sourceId),
@@ -587,7 +710,10 @@ test(
         (record: { type: string }) => record.type === "omp_empty_subsession",
       );
       assert.equal(omitted?.sourceId, `${f.id}:agent:Empty`);
-      assert.deepEqual(omitted.parent, { sourceId: f.id, nativeItemId: "call:0" });
+      assert.deepEqual(omitted.parent, {
+        sourceId: f.id,
+        nativeItemId: `call:${reasoning.length}`,
+      });
       assert.deepEqual(omitted.nativeMetadata[0].header, empty);
 
       server = await startIsolatedT3Server({ t3Home: target });
@@ -609,7 +735,7 @@ test(
       );
       await server.stop();
       server = undefined;
-      assert.equal(cli(...args).status, "already-imported");
+      assert.equal(cli(...args, "--yes").status, "already-imported");
       assert.deepEqual(await sourceTree(f.home), before);
     } finally {
       await server?.stop();

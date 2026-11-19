@@ -7,7 +7,7 @@ import { ORCHESTRATION_V2_WS_METHODS, ThreadId, TurnItemId, WsRpcGroup } from "@
 import { auditFingerprint } from "./fidelity.js";
 import {
   readNativeImportAudit,
-  readNativeImportMetadata,
+  withNativeImportMetadata,
   verifyNativeImportAssets,
 } from "./target.js";
 import type {
@@ -295,12 +295,18 @@ export async function auditNativeImport(options: NativeAuditOptions): Promise<Na
       );
     } else {
       try {
-        const { records } = readNativeImportMetadata(options.t3Home, manifest.threadId);
-        metadata.actual = records.length;
-        if (
-          auditFingerprint(records) !== manifest.metadataDigest ||
-          metadata.expected !== metadata.actual
-        ) {
+        const matches = await withNativeImportMetadata(
+          options.t3Home,
+          manifest.threadId,
+          ({ records }) => {
+            metadata.actual = records.length;
+            return (
+              metadata.expected === records.length &&
+              auditFingerprint(records) === manifest.metadataDigest
+            );
+          },
+        );
+        if (!matches) {
           metadata.changed = Math.max(metadata.expected, metadata.actual, 1);
           issue({ code: "metadata_changed", threadId: manifest.threadId, dimension: "metadata" });
         } else metadata.verified = metadata.actual;

@@ -1,3 +1,5 @@
+import { HistoryList } from "./history-list.js";
+
 /** JSON pieces for normalized history and native T3 JSON values. */
 export function* nativeJsonPieces(
   value: unknown,
@@ -13,30 +15,38 @@ export function* nativeJsonPieces(
       yield JSON.stringify(entry) ?? "null";
       return;
     }
-    const array = Array.isArray(entry);
+    if (Array.isArray(entry) || entry instanceof HistoryList) {
+      yield "[";
+      let index = 0;
+      for (const child of entry) {
+        if (index) yield ",";
+        if (pretty) yield "\n" + "  ".repeat(depth + 1);
+        yield* pieces(prepare(child, String(index++)), depth + 1);
+      }
+      if (pretty && index) yield "\n" + "  ".repeat(depth);
+      yield "]";
+      return;
+    }
     // Object.fromEntries retains JSON's numeric-key ordering after canonical sorting.
-    const object =
-      canonical && !array
-        ? Object.fromEntries(Object.entries(entry).sort(([a], [b]) => a.localeCompare(b)))
-        : entry;
-    const rows: [string | undefined, unknown][] = array
-      ? Array.from(entry, (child, index) => [undefined, prepare(child, String(index))])
-      : Object.entries(object)
-          .map(([key, child]): [string, unknown] => [key, prepare(child, key)])
-          .filter(
-            ([, child]) =>
-              child !== undefined && typeof child !== "function" && typeof child !== "symbol",
-          );
-    yield array ? "[" : "{";
+    const object = canonical
+      ? Object.fromEntries(Object.entries(entry).sort(([a], [b]) => a.localeCompare(b)))
+      : entry;
+    const rows = Object.entries(object)
+      .map(([key, child]): [string, unknown] => [key, prepare(child, key)])
+      .filter(
+        ([, child]) =>
+          child !== undefined && typeof child !== "function" && typeof child !== "symbol",
+      );
+    yield "{";
     for (let index = 0; index < rows.length; index++) {
       if (index) yield ",";
       if (pretty) yield "\n" + "  ".repeat(depth + 1);
       const [key, child] = rows[index]!;
-      if (!array) yield JSON.stringify(key) + (pretty ? ": " : ":");
+      yield JSON.stringify(key) + (pretty ? ": " : ":");
       yield* pieces(child, depth + 1);
     }
     if (pretty && rows.length) yield "\n" + "  ".repeat(depth);
-    yield array ? "]" : "}";
+    yield "}";
   }
   yield* pieces(prepare(value, ""), 0);
 }

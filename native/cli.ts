@@ -6,16 +6,17 @@ import { createOmpReader } from "./omp.js";
 import { auditNativeImport } from "./audit.js";
 import { createClaudeReader } from "./claude.js";
 import { writeNativeJson } from "./json-output.js";
+import { HistorySpool } from "./history-spool.js";
 import {
   importNativeConversations,
   inspectNativeTarget,
-  readNativeImportMetadata,
+  withNativeImportMetadata,
   listNativeProjects,
   NativeImportPlanError,
   withNativeImportRun,
 } from "./target.js";
 import type {
-  NativeConversation,
+  NativeConversationView,
   NativeImportResult,
   NativeReadOptions,
   NativeSource,
@@ -101,6 +102,27 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+async function readHistory(
+  reader: NativeSourceReader,
+  id: string,
+  options: NativeReadOptions,
+): Promise<NativeHistorySnapshot> {
+  if (!reader.readSnapshot) return { conversation: await reader.read(id, options), close() {} };
+  const spool = new HistorySpool();
+  try {
+    const conversation = await reader.readSnapshot(id, options, (value) => spool.json(value));
+    return { conversation, close: () => spool.close() };
+  } catch (error) {
+    spool.close();
+    throw error;
+  }
+}
+
+interface NativeHistorySnapshot {
+  conversation: NativeConversationView;
+  close(): void;
+}
+
 interface BulkImportReport {
   results: NativeWriteResult[];
   failures: Array<{ source: NativeSource; sourceId?: string; error: string }>;
@@ -109,7 +131,7 @@ interface BulkImportReport {
 async function importSourceFamilies(
   source: NativeSource,
   options: NativeReadOptions,
-  importBatch: (conversations: NativeConversation[]) => Promise<NativeImportResult>,
+  importBatch: (conversations: NativeConversationView[]) => Promise<NativeImportResult>,
   report: BulkImportReport,
 ) {
   const history = sourceReader(source);
@@ -135,9 +157,10 @@ async function importSourceFamilies(
     }
     for (const session of sessions) {
       if (children.has(session.id) || covered.has(session.id)) continue;
-      let conversation: NativeConversation;
+      let snapshot: NativeHistorySnapshot | undefined;
       try {
-        conversation = await history.read(
+        snapshot = await readHistory(
+          history,
           source === "omp" ? (session.path ?? session.id) : session.id,
           {
             ...options,
@@ -145,28 +168,32 @@ async function importSourceFamilies(
           },
         );
         if (
-          conversation.id !== session.id ||
-          Boolean(conversation.archived) !== Boolean(session.archived)
+          snapshot.conversation.id !== session.id ||
+          Boolean(snapshot.conversation.archived) !== Boolean(session.archived)
         )
           throw new Error(
             "Session identity or archive state changed after listing; retry when the source is stable.",
           );
       } catch (error) {
+        snapshot?.close();
         report.failures.push({ source, sourceId: session.id, error: errorMessage(error) });
         continue;
       }
-      const parent = conversation.parent?.sourceId;
-      if (parent) {
-        children.set(session.id, parent);
-        continue;
-      }
+      const { conversation } = snapshot;
       try {
+        const parent = conversation.parent?.sourceId;
+        if (parent) {
+          children.set(session.id, parent);
+          continue;
+        }
         const batch = await importBatch([conversation]);
         report.results.push(...batch.results);
         for (const entry of batch.results) covered.add(entry.sourceId);
       } catch (error) {
         if (!(error instanceof NativeImportPlanError)) throw error;
         report.failures.push({ source, sourceId: session.id, error: error.message });
+      } finally {
+        snapshot.close();
       }
     }
     for (const [sourceId, parent] of children) {
@@ -190,6 +217,7 @@ export async function runNativeCli(args: string[]): Promise<void> {
     .version(__IMPORTER_VERSION__)
     .exitOverride();
   let reader: NativeSourceReader | undefined;
+  const snapshots: NativeHistorySnapshot[] = [];
   let json = args.includes("--json");
 
   sourceOptions(
@@ -212,9 +240,18 @@ export async function runNativeCli(args: string[]): Promise<void> {
     .action(async (values: Record<string, unknown>) => {
       json = Boolean(values.json);
       reader = sourceReader(values.source as NativeSource);
-      const conversation = await reader.read(values.thread as string, readOptions(values));
+      const snapshot = await readHistory(reader, values.thread as string, readOptions(values));
+      snapshots.push(snapshot);
+      const { conversation } = snapshot;
       if (values.full) await writeNativeJson(conversation, !json);
-      else
+      else {
+        const itemKinds: Record<string, number> = {};
+        let items = 0;
+        for (const turn of conversation.turns)
+          for (const item of turn.items) {
+            items++;
+            itemKinds[item.kind] = (itemKinds[item.kind] ?? 0) + 1;
+          }
         print(
           {
             schemaVersion: 1,
@@ -225,25 +262,14 @@ export async function runNativeCli(args: string[]): Promise<void> {
             active: conversation.active,
             ...(conversation.archived === undefined ? {} : { archived: conversation.archived }),
             turns: conversation.turns.length,
-            items: conversation.turns.reduce((count, turn) => count + turn.items.length, 0),
-            itemKinds: Object.fromEntries(
-              [
-                ...new Set(
-                  conversation.turns.flatMap((turn) => turn.items.map((item) => item.kind)),
-                ),
-              ].map((kind) => [
-                kind,
-                conversation.turns.reduce(
-                  (count, turn) => count + turn.items.filter((item) => item.kind === kind).length,
-                  0,
-                ),
-              ]),
-            ),
+            items,
+            itemKinds,
             ...(conversation.sourceCoverage ? { sourceCoverage: conversation.sourceCoverage } : {}),
             warnings: conversation.warnings,
           },
           json,
         );
+      }
     });
 
   program
@@ -290,14 +316,10 @@ export async function runNativeCli(args: string[]): Promise<void> {
     .requiredOption("--thread <id>", "destination T3 thread ID")
     .option("--t3-home <path>", "T3 home (default: T3CODE_HOME or ~/.t3)")
     .option("--json", "one JSON result on stdout")
-    .action((values: Record<string, unknown>) => {
+    .action(async (values: Record<string, unknown>) => {
       json = Boolean(values.json);
-      print(
-        {
-          schemaVersion: 1,
-          ...readNativeImportMetadata(targetHome(values), values.thread as string),
-        },
-        json,
+      await withNativeImportMetadata(targetHome(values), values.thread as string, (metadata) =>
+        writeNativeJson({ schemaVersion: 1, ...metadata }, !json),
       );
     });
 
@@ -374,15 +396,17 @@ export async function runNativeCli(args: string[]): Promise<void> {
         ? (await reader.list(options)).map((session) => session.id)
         : [...new Set(ids)];
       if (selected.length === 0) throw new Error("No matching source sessions found.");
-      const conversations: NativeConversation[] = [];
-      for (const id of selected) conversations.push(await reader.read(id, options));
-      await reader.close();
-      reader = undefined;
+      const conversations: NativeConversationView[] = [];
+      for (const id of selected) {
+        const snapshot = await readHistory(reader, id, options);
+        snapshots.push(snapshot);
+        conversations.push(snapshot.conversation);
+      }
       // A selected family root already supplies its descendants. Remove only
       // redundant top-level selections; nested duplicate/ambiguous lineage stays
       // intact for the writer's validation.
       const nested = new Set<string>();
-      const visited = new Set<NativeConversation>();
+      const visited = new Set<NativeConversationView>();
       const pending = conversations.flatMap((conversation) => conversation.children ?? []);
       while (pending.length) {
         const child = pending.pop()!;
@@ -503,6 +527,7 @@ export async function runNativeCli(args: string[]): Promise<void> {
         ? explicit
         : 6;
   } finally {
+    for (const snapshot of snapshots) snapshot.close();
     await reader?.close();
   }
 }

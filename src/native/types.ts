@@ -94,6 +94,26 @@ export interface NativeConversation extends NativeSourceSummary {
   active: boolean;
 }
 
+export interface NativeHistoryCollection<T> extends Iterable<T> {
+  readonly length: number;
+}
+
+export interface NativeHistoryTurnView extends Omit<NativeHistoryTurn, "items"> {
+  items: NativeHistoryCollection<NativeHistoryItem>;
+}
+
+/** A replayable history view, optionally backed by temporary reader storage. */
+export interface NativeConversationView extends Omit<
+  NativeConversation,
+  "turns" | "nativeMetadata" | "children"
+> {
+  turns: NativeHistoryCollection<NativeHistoryTurnView>;
+  nativeMetadata?: NativeHistoryCollection<JsonValue>;
+  children?: NativeConversationView[];
+}
+
+export type NativeHistoryStage = <T>(value: T) => () => T;
+
 export interface NativeReadOptions {
   workspace?: string;
   since?: string;
@@ -109,6 +129,11 @@ export interface NativeReadOptions {
 export interface NativeSourceReader {
   list(options: NativeReadOptions): Promise<NativeSourceSummary[]>;
   read(id: string, options: NativeReadOptions): Promise<NativeConversation>;
+  readSnapshot?(
+    id: string,
+    options: NativeReadOptions,
+    stage: NativeHistoryStage,
+  ): Promise<NativeConversationView>;
   close(): Promise<void>;
 }
 

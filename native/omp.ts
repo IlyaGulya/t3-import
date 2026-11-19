@@ -7,8 +7,11 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { JSONParser } from "@streamparser/json";
+import { createOmpReplyReceiver } from "./omp-transport.js";
 import type {
   NativeConversation,
+  NativeConversationView,
+  NativeHistoryStage,
   NativeReadOptions,
   NativeSourceReader,
   NativeSourceSummary,
@@ -17,7 +20,7 @@ import type {
 const PACKAGE = "@oh-my-pi/pi-coding-agent";
 const PACKAGE_VERSION = "18.22.0";
 const exec = promisify(execFile);
-const MAX_HELPER_BYTES = 2 * 1024 * 1024 * 1024;
+const MAX_LIST_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_STDERR_BYTES = 16 * 1024;
 
 interface OmpReaderDependencies {
@@ -169,6 +172,7 @@ export function createOmpReader(dependencies: OmpReaderDependencies = {}): Nativ
     operation: "list" | "read",
     options: NativeReadOptions,
     id?: string,
+    stage?: NativeHistoryStage,
   ): Promise<unknown> => {
     if (closed) throw new Error("OMP history reader is closed.");
     const packageRoot = await resolveOmpPackage(options);
@@ -200,6 +204,7 @@ export function createOmpReader(dependencies: OmpReaderDependencies = {}): Nativ
     });
     children.add(child);
     const result = new Promise<unknown>((accept, reject) => {
+      const history = stage ? createOmpReplyReceiver(stage) : undefined;
       const parser = new JSONParser({ paths: ["$"], stringBufferSize: 64 * 1024 });
       let reply: { ok?: unknown; value?: unknown; error?: unknown } | undefined;
       parser.onValue = ({ value }) => {
@@ -215,18 +220,15 @@ export function createOmpReader(dependencies: OmpReaderDependencies = {}): Nativ
       child.stdout.on("data", (chunk: Buffer) => {
         if (failure) return;
         timer.refresh();
-        size += chunk.length;
-        if (size > MAX_HELPER_BYTES) {
-          failure = new Error(
-            "OMP history exceeds the 2 GiB helper transport budget; no partial history was imported.",
-          );
-          stopChild(child);
-          return;
-        }
         try {
-          parser.write(chunk);
+          if (history) history.push(chunk);
+          else {
+            size += chunk.length;
+            if (size > MAX_LIST_BYTES) throw new Error("OMP session list exceeds its byte budget.");
+            parser.write(chunk);
+          }
         } catch (error) {
-          failure = new Error("OMP helper returned invalid JSON.", { cause: error });
+          failure = error instanceof Error ? error : new Error("OMP helper returned invalid JSON.");
           stopChild(child);
         }
       });
@@ -253,6 +255,7 @@ export function createOmpReader(dependencies: OmpReaderDependencies = {}): Nativ
             ),
           );
         try {
+          if (history) return accept(history.finish());
           if (!parser.isEnded) parser.end();
           if (reply?.ok !== true)
             return reject(
@@ -263,9 +266,9 @@ export function createOmpReader(dependencies: OmpReaderDependencies = {}): Nativ
               ),
             );
           accept(reply.value);
-        } catch {
+        } catch (error) {
           reject(
-            new Error("OMP native helper returned invalid JSON; no partial history was imported."),
+            error instanceof Error ? error : new Error("OMP helper returned invalid history."),
           );
         }
       });
@@ -278,6 +281,12 @@ export function createOmpReader(dependencies: OmpReaderDependencies = {}): Nativ
       pending.delete(result);
     }
   };
+  const readSnapshot = async (
+    id: string,
+    options: NativeReadOptions,
+    stage: NativeHistoryStage,
+  ): Promise<NativeConversationView> =>
+    (await call("read", options, id, stage)) as NativeConversationView;
   return {
     async list(options) {
       const result = await call("list", options);
@@ -296,16 +305,19 @@ export function createOmpReader(dependencies: OmpReaderDependencies = {}): Nativ
         }
       return summaries;
     },
+    readSnapshot,
     async read(id, options) {
-      const result = await call("read", options, id);
-      if (
-        !result ||
-        typeof result !== "object" ||
-        Reflect.get(result, "source") !== "omp" ||
-        !Array.isArray(Reflect.get(result, "turns"))
-      )
-        throw new Error("OMP native helper returned an invalid conversation.");
-      return result as NativeConversation;
+      const conversation = await readSnapshot(id, options, (value) => () => value);
+      const materialize = (view: NativeConversationView): NativeConversation => {
+        const { turns, nativeMetadata, children, ...head } = view;
+        return {
+          ...head,
+          turns: Array.from(turns, (turn) => ({ ...turn, items: Array.from(turn.items) })),
+          ...(nativeMetadata ? { nativeMetadata: Array.from(nativeMetadata) } : {}),
+          ...(children ? { children: children.map(materialize) } : {}),
+        };
+      };
+      return materialize(conversation);
     },
     async close() {
       if (closed) return;

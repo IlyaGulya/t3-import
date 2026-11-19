@@ -40,7 +40,7 @@ The source readers still own format decoding and selected-branch semantics. Clau
 
 If a very long first Claude message exceeds the SDK file-metadata sampling window, metadata falls back to a scoped SDK store with shortened display text only. The history reader retains the original bodies. This case reports `native_session_metadata_fallback` and uses the last native record time for metadata; no current-time timestamp is fabricated. All Claude reads compare per-stream native record digests across two SDK family replays, including children, sidecars and additions/removals. A changed family rejects even snapshot import before writing target events.
 
-OMP uses its native `collectSubSessions`, including nested, compressed and advisor histories. Aborted snapshots stay interrupted, malformed/unreadable families fail closed, and native model/compaction/visibility behavior is reused. A child card is anchored when exactly one selected task launch result names its allocated agent ID. Child snapshots have no independent continuation binding.
+OMP's native loader decodes each transcript from its export layout, including nested, compressed and advisor histories. Aborted snapshots stay interrupted, malformed or changing families fail closed, and native model, compaction and visibility behavior is reused. A child card is anchored when exactly one selected task launch result names its allocated agent ID. Child snapshots have no independent continuation binding.
 
 When an inactive OMP allocation has no transcript and no descendant history to display, its header, known launch reference and retained records go into the parent thread's native metadata. The parent's original task record remains visible.
 

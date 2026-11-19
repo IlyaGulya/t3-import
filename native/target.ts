@@ -1,4 +1,6 @@
 import { auditFingerprint } from "./fidelity.js";
+import { HistoryList } from "./history-list.js";
+import { HistorySpool } from "./history-spool.js";
 import {
   projectTurnItemForWire,
   projectTurnItemForDetail,
@@ -33,6 +35,7 @@ import {
   PROVIDER_SEND_TURN_MAX_FILE_BYTES,
   PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
   OrchestrationV2DomainEvent,
+  OrchestrationV2DomainEventJson,
   OrchestrationV2ProviderThread,
   ApplicationProjectEvent,
   ProviderInstanceConfig,
@@ -64,8 +67,10 @@ import { resolveManagedCodexHomeLayout } from "@t3-native/server/provider/CodexM
 import { resolveClaudeHomePath } from "@t3-native/server/provider/Drivers/ClaudeHome.ts";
 import { inferImageExtension, parseBase64DataUrl } from "@t3-native/server/imageMime.ts";
 import type {
-  NativeConversation,
+  NativeConversationView,
   NativeHistoryItem,
+  NativeHistoryCollection,
+  NativeTerminalStatus,
   NativeImportResult,
   NativeWriteOptions,
   NativeWriteResult,
@@ -77,6 +82,7 @@ import type {
 const SUPPORTED = __T3_NATIVE_REFERENCE__.supportedMigrations;
 const PREFIX = "t3-import-native:v1";
 const decodeEvent = Schema.decodeUnknownSync(OrchestrationV2DomainEvent);
+const decodeStagedEvent = Schema.decodeUnknownSync(OrchestrationV2DomainEventJson);
 const hash = (value: string | Uint8Array) => createHash("sha256").update(value).digest("hex");
 const uuid = (value: string) => {
   const bytes = hash(value).slice(0, 32).split("");
@@ -186,7 +192,15 @@ export function inspectNativeTarget(t3Home: string): NativeTargetInspection {
 }
 
 /** Importer-owned opaque metadata, separate from T3's typed projections. */
-export function readNativeImportMetadata(t3Home: string, threadId: string) {
+export async function withNativeImportMetadata<T>(
+  t3Home: string,
+  threadId: string,
+  use: (value: {
+    sourceKey: string;
+    threadId: string;
+    records: NativeHistoryCollection<JsonValue>;
+  }) => T | Promise<T>,
+): Promise<T> {
   const inspection = inspectNativeTarget(t3Home);
   if (!inspection.supported) throw new Error(inspection.reason ?? "Unsupported T3 target.");
   const db = new DatabaseSync(paths(t3Home).db, { readOnly: true });
@@ -197,16 +211,40 @@ export function readNativeImportMetadata(t3Home: string, threadId: string) {
       ? db.prepare("SELECT source_key FROM t3_native_imports WHERE thread_id=?").get(threadId)
       : undefined;
     if (!imported) throw new Error(`Thread '${threadId}' has no native importer record.`);
+    const sourceKey = String(imported.source_key);
+    if (hasTable("t3_native_import_metadata_records")) {
+      const count = Number(
+        db
+          .prepare(
+            "SELECT COUNT(*) AS total FROM t3_native_import_metadata_records WHERE thread_id=?",
+          )
+          .get(threadId)?.total,
+      );
+      if (count) {
+        const record = db.prepare(
+          "SELECT record_json FROM t3_native_import_metadata_records WHERE thread_id=? AND record_index=?",
+        );
+        const records = new HistoryList<JsonValue>();
+        for (let index = 0; index < count; index++) {
+          records.append(() => {
+            const row = record.get(threadId, index);
+            if (!row) throw new Error(`Missing native metadata record '${index}'.`);
+            return JSON.parse(String(row.record_json)) as JsonValue;
+          });
+        }
+        return await use({ sourceKey, threadId, records });
+      }
+    }
     const row = hasTable("t3_native_import_metadata")
       ? db
           .prepare("SELECT records_json FROM t3_native_import_metadata WHERE thread_id=?")
           .get(threadId)
       : undefined;
-    return {
-      sourceKey: String(imported.source_key),
+    return await use({
+      sourceKey,
       threadId,
-      records: row ? (JSON.parse(String(row.records_json)) as unknown[]) : [],
-    };
+      records: row ? (JSON.parse(String(row.records_json)) as JsonValue[]) : [],
+    });
   } finally {
     db.close();
   }
@@ -307,27 +345,63 @@ export async function initializeNativeTarget(t3Home: string, migration = 98): Pr
 
 interface Asset {
   finalPath: string;
-  bytes: Buffer;
+  read: () => Buffer;
+  sha256: string;
+  sizeBytes: number;
   auditRelativePath?: string;
 }
+type AssetInput = Pick<Asset, "finalPath" | "auditRelativePath"> & { bytes: Buffer };
+type ThreadCreated = Extract<DomainEvent, { type: "thread.created" }>;
+type ItemUpdated = Extract<DomainEvent, { type: "turn-item.updated" }>;
+type RunCreated = Extract<DomainEvent, { type: "run.created" }>;
+type Launch = Pick<ItemUpdated["payload"], "id" | "nodeId" | "providerTurnId" | "ordinal"> & {
+  runId: ItemUpdated["runId"];
+};
+type PlannedEvent = { read: () => DomainEvent; sizeBytes: number };
+type InsertedEvents = { ordinal: number; events: PlannedEvent[]; links: PlannedEvent[] };
+
+function stageValue<T>(spool: HistorySpool | undefined, value: T): () => T {
+  return spool?.json(value) ?? (() => value);
+}
+
+function stageEvent(spool: HistorySpool | undefined, event: DomainEvent): PlannedEvent {
+  if (!spool) return { read: () => event, sizeBytes: 0 };
+  const bytes = Buffer.from(JSON.stringify(event));
+  return storedEvent(spool.bytes(bytes), bytes.length);
+}
+
+function storedEvent(read: () => Buffer, sizeBytes: number): PlannedEvent {
+  return { read: () => decodeStagedEvent(JSON.parse(read().toString("utf8"))), sizeBytes };
+}
+
 interface Plan {
-  conversation: NativeConversation;
+  conversation: NativeConversationView;
   sourceKey: string;
   fingerprint: string;
+  historyFingerprint: () => string;
   result: NativeWriteResult;
   projectEvent?: UnsequencedProjectEvent;
   providerThread: typeof OrchestrationV2ProviderThread.Type;
-  events: DomainEvent[];
+  creation: ThreadCreated;
+  events: PlannedEvent[];
+  recordEvent: (event: DomainEvent) => PlannedEvent;
+  launches: Map<string, Launch>;
+  runRoots: Map<RunCreated["payload"]["id"], RunCreated["payload"]["rootNodeId"]>;
+  createdChildScope: boolean;
+  lastStatus: NativeTerminalStatus;
+  prompt: () => string;
+  answer: () => string | null;
   assets: Asset[];
-  metadata: JsonValue[];
+  metadata: HistoryList<JsonValue>;
   projectRoot: string;
   escrowedFields: number;
   childThreadIds?: string[];
-  childInsertions?: Map<string, DomainEvent[]>;
+  childInsertions: Map<string, InsertedEvents>;
+  detachedLinks: PlannedEvent[];
   runtime?: ProviderRuntime.ProviderSessionRuntime;
 }
 
-function providerSelection(conversation: NativeConversation, options: NativeWriteOptions) {
+function providerSelection(conversation: NativeConversationView, options: NativeWriteOptions) {
   const driver = ProviderDriverKind.make(conversation.driver);
   const instance = options.providerInstance ?? conversation.driver;
   const p = paths(options.t3Home);
@@ -480,7 +554,7 @@ function imageAttachments(
   item: NativeHistoryItem,
   threadId: string,
   p: ReturnType<typeof paths>,
-  assets: Asset[],
+  addAsset: (asset: AssetInput) => void,
   warnings: string[],
 ) {
   const references: string[] = [];
@@ -515,7 +589,7 @@ function imageAttachments(
     }
     const id = `native-${hash(threadId).slice(0, 24)}-${uuid(`${item.id}:${image.id}:${hash(bytes)}`)}`;
     const finalPath = join(p.assets, `${id}${extension}`);
-    assets.push({ finalPath, bytes });
+    addAsset({ finalPath, bytes });
     if (bytes.length > PROVIDER_SEND_TURN_MAX_FILE_BYTES) {
       warnings.push(
         `Image '${image.name}' exceeds T3's file attachment limit; the original is retained as a local asset.`,
@@ -560,12 +634,14 @@ function nativeEvent(
 }
 
 function createPlan(
-  conversation: NativeConversation,
+  conversation: NativeConversationView,
   options: NativeWriteOptions,
   allocator: IdAllocator.IdAllocatorV2["Service"],
   projectId: ProjectId,
   projectRoot: string,
   newProject: boolean,
+  launchIds: ReadonlySet<string> | undefined,
+  spool?: HistorySpool,
 ): Plan {
   const provider = providerSelection(conversation, options);
   const driver = ProviderDriverKind.make(conversation.driver);
@@ -586,9 +662,26 @@ function createPlan(
   const warnings = [...conversation.warnings];
   const createdAt = at(conversation.createdAt);
   const updatedAt = at(conversation.updatedAt);
-  const events: DomainEvent[] = [];
+  const events: PlannedEvent[] = [];
+  const recordEvent = (event: DomainEvent) => stageEvent(spool, event);
   const assets: Asset[] = [];
-  const metadata: JsonValue[] = [...(conversation.nativeMetadata ?? [])];
+  const addAsset = ({ bytes, ...asset }: AssetInput) => {
+    assets.push({
+      ...asset,
+      read: options.dryRun
+        ? () => {
+            throw new Error("Cannot read an asset from a dry-run.");
+          }
+        : (spool?.bytes(bytes) ?? (() => bytes)),
+      sha256: hash(bytes),
+      sizeBytes: bytes.length,
+    });
+  };
+  const metadata = new HistoryList<JsonValue>();
+  const addMetadata = (record: JsonValue) => {
+    if (!options.dryRun) metadata.append(stageValue(spool, record));
+  };
+  if (!options.dryRun) for (const record of conversation.nativeMetadata ?? []) addMetadata(record);
   if (options.restoreWorkspace && options.resume)
     throw new Error("Recorded workspaces require history-only import.");
   const displayWorkspace = options.restoreWorkspace
@@ -605,7 +698,7 @@ function createPlan(
         continue;
       }
       const finalPath = join(displayWorkspace, path);
-      assets.push({
+      addAsset({
         finalPath,
         bytes: Buffer.from(file.content),
         auditRelativePath: relative(p.state, finalPath),
@@ -619,13 +712,13 @@ function createPlan(
       completeProject: false,
       files: captured,
     };
-    metadata.push(provenance);
+    addMetadata(provenance);
     const finalPath = join(
       p.state,
       "recorded-workspace-manifests",
       `${hash(sourceKey).slice(0, 24)}.json`,
     );
-    assets.push({
+    addAsset({
       finalPath,
       bytes: Buffer.from(JSON.stringify(provenance, null, 2)),
       auditRelativePath: relative(p.state, finalPath),
@@ -638,13 +731,35 @@ function createPlan(
       "workspace_unavailable: original directory does not exist; use --restore-workspace for recorded files.",
     );
   let escrowedFields = 0;
+  const launches = new Map<string, Launch>();
+  const runRoots: Plan["runRoots"] = new Map();
   const push = (
     key: string,
     type: string,
     time: DateTime.Utc,
     payload: unknown,
     extra: Record<string, unknown> = {},
-  ) => events.push(nativeEvent(threadId, key, type, time, payload, extra));
+  ) => {
+    const event = nativeEvent(threadId, key, type, time, payload, extra);
+    if (!options.dryRun) events.push(recordEvent(event));
+    if (event.type === "run.created") runRoots.set(event.payload.id, event.payload.rootNodeId);
+    if (event.type === "turn-item.updated") {
+      const { id, nativeItemRef, nodeId, providerTurnId, ordinal } = event.payload;
+      if (
+        nativeItemRef?.nativeId &&
+        launchIds?.has(nativeItemRef.nativeId) &&
+        !launches.has(nativeItemRef.nativeId)
+      )
+        launches.set(nativeItemRef.nativeId, {
+          id,
+          nodeId,
+          providerTurnId,
+          ordinal,
+          runId: event.runId,
+        });
+    }
+    return event;
+  };
   const archived = !conversation.parent && conversation.archived === true;
   const settled = !archived && options.settled === true;
   if (archived)
@@ -677,9 +792,9 @@ function createPlan(
     settledAt: settled ? updatedAt : null,
     lastVisitedAt: null,
   };
-  push("thread", "thread.created", createdAt, appThread, {
+  const creation = nativeEvent(threadId, "thread", "thread.created", createdAt, appThread, {
     providerInstanceId: provider.instanceId,
-  });
+  }) as ThreadCreated;
   const providerThread = Schema.decodeUnknownSync(OrchestrationV2ProviderThread)({
     id: providerThreadId,
     driver: conversation.driver,
@@ -706,7 +821,19 @@ function createPlan(
   });
   let ordinal = 0;
   let providerOrdinal = 0;
-  conversation.turns.forEach((turn, turnIndex) => {
+  let turnIndex = 0;
+  let messages = 0;
+  let lastStatus: NativeTerminalStatus = "completed";
+  let prompt: string | undefined;
+  let answer: string | null = null;
+  const turnIds = new Set<string>();
+  for (const turn of conversation.turns) {
+    if (!turn.id.trim() || turnIds.has(turn.id))
+      throw new NativeImportPlanError(`Duplicate or empty turn id in '${sourceKey}'.`);
+    turnIds.add(turn.id);
+    if (!["completed", "interrupted", "failed"].includes(turn.status))
+      throw new NativeImportPlanError(`Source '${sourceKey}' has a non-terminal turn.`);
+    lastStatus = turn.status;
     const runId = allocator.derive.run({ threadId, ordinal: turnIndex + 1 });
     const attemptId = allocator.derive.runAttempt({ runId, attemptOrdinal: 1 });
     const rootNodeId = allocator.derive.rootNode({ runId });
@@ -717,18 +844,29 @@ function createPlan(
     // One local user turn may contain assistant replies from different native models.
     // T3 stores executed models on provider turns, so preserve those model sections
     // within the same local run/attempt; only the first keeps the native turn ref.
-    const sections: Array<{ model?: string; items: NativeHistoryItem[] }> = [
-      { ...(turn.model?.trim() ? { model: turn.model.trim() } : {}), items: [] },
+    const firstModel = turn.model?.trim();
+    const sections: Array<{ model?: string; firstAt?: string; lastAt?: string }> = [
+      firstModel ? { model: firstModel } : {},
     ];
+    const itemSections = new Map<string, number>();
+    let firstUserId: string | undefined;
     for (const item of turn.items) {
-      if (idleMetadata(item)) continue;
+      if (!item.id.trim() || itemSections.has(item.id))
+        throw new NativeImportPlanError(`Duplicate or empty item id in turn '${turn.id}'.`);
+      if (item.kind === "user_message") firstUserId ??= item.id;
+      if (idleMetadata(item)) {
+        itemSections.set(item.id, -1);
+        continue;
+      }
       const model = item.model?.trim();
       let current = sections[sections.length - 1]!;
-      if (model && current.model && model !== current.model && current.items.length) {
-        current = { model, items: [] };
+      if (model && current.model && model !== current.model && current.firstAt !== undefined) {
+        current = { model };
         sections.push(current);
       } else if (model) current.model = model;
-      current.items.push(item);
+      current.firstAt ??= item.timestamp;
+      current.lastAt = item.timestamp;
+      itemSections.set(item.id, sections.length - 1);
     }
     const sectionIds = sections.map((_, index) =>
       allocator.derive.providerTurn({
@@ -740,20 +878,14 @@ function createPlan(
       }),
     );
     const providerTurnId = sectionIds[0]!;
-    const itemProviderTurns = new Map(
-      sections.flatMap((section, index) =>
-        section.items.map((item) => [item.id, sectionIds[index]!] as const),
-      ),
-    );
     const startedAt = at(turn.startedAt);
     const completedAt = at(turn.completedAt);
-    const firstUser = turn.items.find((item) => item.kind === "user_message");
     const nativeItemKey = (id: string) => `${sourceKey}:${turn.id}:${id}`;
     const userMessageId = allocator.derive.messageFromProviderItem({
       driver,
-      nativeItemId: nativeItemKey(firstUser?.id ?? "missing-user-input"),
+      nativeItemId: nativeItemKey(firstUserId ?? "missing-user-input"),
     });
-    if (!firstUser)
+    if (firstUserId === undefined)
       warnings.push(
         `Turn '${turn.id}' has no visible user input; its run retains an unmaterialized input reference.`,
       );
@@ -838,19 +970,18 @@ function createPlan(
               : null,
           ordinal: ++providerOrdinal,
           status: turn.status,
-          startedAt: index === 0 ? startedAt : at(section.items[0]!.timestamp),
-          completedAt:
-            index === sections.length - 1
-              ? completedAt
-              : at(section.items[section.items.length - 1]!.timestamp),
+          startedAt: index === 0 ? startedAt : at(section.firstAt!),
+          completedAt: index === sections.length - 1 ? completedAt : at(section.lastAt!),
           ...(section.model ? { model: section.model } : {}),
         },
         { ...common, nodeId: rootNodeId },
       ),
     );
-    turn.items.forEach((item, itemIndex) => {
-      const independent = idleMetadata(item);
-      const providerTurnId = independent ? null : itemProviderTurns.get(item.id)!;
+    let itemIndex = 0;
+    for (const item of turn.items) {
+      const section = itemSections.get(item.id)!;
+      const independent = section < 0;
+      const providerTurnId = independent ? null : sectionIds[section]!;
       const key = nativeItemKey(item.id);
       const itemId = allocator.derive.turnItemFromProviderItem({ driver, nativeItemId: key });
       const messageId = allocator.derive.messageFromProviderItem({ driver, nativeItemId: key });
@@ -860,7 +991,7 @@ function createPlan(
         item,
         threadId,
         paths(options.t3Home),
-        assets,
+        addAsset,
         warnings,
       );
       const nativeItemRef = { driver: conversation.driver, nativeId: item.id, strength: "strong" };
@@ -882,7 +1013,7 @@ function createPlan(
       };
       if (DateTime.toEpochMillis(base.completedAt) < DateTime.toEpochMillis(base.startedAt))
         throw new Error(`Native item '${item.id}' ends before it starts.`);
-      const prefix = `item:${turnIndex}:${itemIndex}`;
+      const prefix = `item:${turnIndex}:${itemIndex++}`;
       const content = { ...item.data };
       const reserved = [
         "id",
@@ -909,6 +1040,11 @@ function createPlan(
         if (typeof content.text !== "string")
           throw new Error(`Source message '${item.id}' has no text.`);
         const role = item.kind === "user_message" ? "user" : "assistant";
+        if (conversation.parent) {
+          if (role === "user") prompt ??= content.text;
+          else answer = content.text;
+        }
+        messages++;
         const creation = {
           createdBy: role === "user" ? "user" : "agent",
           creationSource: "server",
@@ -940,7 +1076,7 @@ function createPlan(
           messageId,
           attachments,
           ...(role === "user"
-            ? { inputIntent: firstUser?.id === item.id ? "turn_start" : "steer" }
+            ? { inputIntent: firstUserId === item.id ? "turn_start" : "steer" }
             : { streaming: false }),
         });
       } else if ((attachments.length || references.length) && item.kind === "dynamic_tool") {
@@ -1023,14 +1159,13 @@ function createPlan(
           },
           { ...common, nodeId },
         );
-      push(
+      const stored = push(
         `${prefix}:turn-item`,
         "turn-item.updated",
         time,
         { ...content, ...base, type: item.kind },
         independent ? { providerInstanceId: provider.instanceId } : { ...common, nodeId },
       );
-      const stored = events.at(-1)!;
       const storedPayload = stored.payload as unknown as Record<string, unknown>;
       const exposedPayload =
         stored.type === "turn-item.updated"
@@ -1045,32 +1180,47 @@ function createPlan(
       );
       if (Object.keys(removed).length) {
         escrowedFields += Object.keys(removed).length;
-        metadata.push({
+        addMetadata({
           type: "t3_import_preserved_fields",
           uuid: item.id,
           kind: item.kind,
           fields: removed,
         });
       }
-    });
-  });
-  const { archived: sourceArchived, ...history } = conversation;
-  const fingerprint = auditFingerprint({
-    conversation: { ...history, ...(sourceArchived ? { archived: true } : {}), warnings: [] },
-    provider,
-    resume: options.resume,
-    assets: assets.map((asset) => ({ name: basename(asset.finalPath), hash: hash(asset.bytes) })),
-  });
+    }
+    turnIndex++;
+  }
+  const readPrompt = stageValue(spool, prompt ?? "");
+  const readAnswer = stageValue(spool, answer);
   return {
     conversation,
     sourceKey,
-    fingerprint,
+    fingerprint: "",
+    historyFingerprint: () => {
+      const { archived: sourceArchived, ...history } = conversation;
+      return auditFingerprint({
+        conversation: { ...history, ...(sourceArchived ? { archived: true } : {}), warnings: [] },
+        provider,
+        resume: options.resume,
+        assets: assets.map((asset) => ({ name: basename(asset.finalPath), hash: asset.sha256 })),
+      });
+    },
     providerThread,
+    creation,
     events,
+    recordEvent,
+    launches,
+    runRoots,
+    createdChildScope: false,
+    lastStatus,
+    prompt: readPrompt,
+    answer: readAnswer,
     assets,
     metadata,
     projectRoot,
     escrowedFields,
+    childInsertions: new Map(),
+    detachedLinks: [],
     result: {
       source: conversation.source,
       sourceId: conversation.id,
@@ -1078,15 +1228,8 @@ function createPlan(
       projectId,
       status: options.dryRun ? "dry-run" : "imported",
       turns: conversation.turns.length,
-      items: conversation.turns.reduce((sum, turn) => sum + turn.items.length, 0),
-      messages: conversation.turns.reduce(
-        (sum, turn) =>
-          sum +
-          turn.items.filter(
-            (item) => item.kind === "user_message" || item.kind === "assistant_message",
-          ).length,
-        0,
-      ),
+      items: ordinal,
+      messages,
       resumable: options.resume,
       quality: {
         targetSchema: "validated",
@@ -1147,29 +1290,17 @@ function createPlan(
 
 /** Preserve the native parent's relationship without inventing another user turn. */
 function linkChildPlan(parent: Plan, child: Plan, allocator: IdAllocator.IdAllocatorV2["Service"]) {
-  const parentThreadEvent = parent.events.find((event) => event.type === "thread.created")!;
-  const childThreadIndex = child.events.findIndex((event) => event.type === "thread.created");
-  const childThreadEvent = child.events[childThreadIndex]!;
-  if (parentThreadEvent.type !== "thread.created" || childThreadEvent.type !== "thread.created")
-    throw new Error("Missing imported thread creation.");
+  const parentThreadEvent = parent.creation;
+  const childThreadEvent = child.creation;
   const parentItem = child.conversation.parent?.nativeItemId
-    ? parent.events.find(
-        (event) =>
-          event.type === "turn-item.updated" &&
-          event.payload.nativeItemRef?.nativeId === child.conversation.parent?.nativeItemId,
-      )
+    ? parent.launches.get(child.conversation.parent.nativeItemId)
     : undefined;
-  const runEvent =
-    parentItem?.runId === undefined
-      ? undefined
-      : parent.events.find(
-          (event) => event.type === "run.created" && event.payload.id === parentItem.runId,
-        );
-  const run = runEvent?.type === "run.created" ? runEvent.payload : undefined;
+  const runId = parentItem?.runId;
+  const runRoot = runId === undefined ? undefined : parent.runRoots.get(runId);
   (parent.childThreadIds ??= []).push(child.result.threadId);
   if (child.conversation.parent?.relationship === "fork") {
-    const forkNodeId = parentItem?.type === "turn-item.updated" ? parentItem.payload.nodeId : null;
-    child.events[childThreadIndex] = nativeEvent(
+    const forkNodeId = parentItem?.nodeId;
+    child.creation = nativeEvent(
       child.result.threadId,
       "thread",
       "thread.created",
@@ -1188,7 +1319,7 @@ function linkChildPlan(parent: Plan, child: Plan, allocator: IdAllocator.IdAlloc
         settledAt: childThreadEvent.payload.updatedAt,
       },
       { providerInstanceId: childThreadEvent.payload.providerInstanceId },
-    );
+    ) as ThreadCreated;
     return;
   }
   const driver = ProviderDriverKind.make(child.conversation.driver);
@@ -1203,57 +1334,53 @@ function linkChildPlan(parent: Plan, child: Plan, allocator: IdAllocator.IdAlloc
   const now = at(child.conversation.updatedAt);
   const startedAt = at(child.conversation.createdAt);
   const parentScopeId =
-    run?.rootNodeId ??
+    runRoot ??
     allocator.derive.nodeFromProviderItem({
       driver: ProviderDriverKind.make(parent.conversation.driver),
       nativeItemId: `${PREFIX}:child-scope:${parent.sourceKey}`,
     });
-  if (
-    !run &&
-    !parent.events.some(
-      (event) => event.type === "node.updated" && event.payload.id === parentScopeId,
-    )
-  ) {
+  if (!runRoot && !parent.createdChildScope) {
+    parent.createdChildScope = true;
     const scopeTime = parentThreadEvent.payload.createdAt;
     parent.events.push(
-      nativeEvent(
-        parent.result.threadId,
-        "children:scope",
-        "node.updated",
-        scopeTime,
-        {
-          id: parentScopeId,
-          threadId: parent.result.threadId,
-          runId: null,
-          parentNodeId: null,
-          rootNodeId: parentScopeId,
-          kind: "system",
-          status: "completed",
-          countsForRun: false,
-          providerThreadId: parent.providerThread.id,
-          providerTurnId: null,
-          nativeItemRef: null,
-          runtimeRequestId: null,
-          checkpointScopeId: null,
-          startedAt: scopeTime,
-          completedAt: scopeTime,
-        },
-        { nodeId: parentScopeId, providerInstanceId: parentThreadEvent.payload.providerInstanceId },
+      parent.recordEvent(
+        nativeEvent(
+          parent.result.threadId,
+          "children:scope",
+          "node.updated",
+          scopeTime,
+          {
+            id: parentScopeId,
+            threadId: parent.result.threadId,
+            runId: null,
+            parentNodeId: null,
+            rootNodeId: parentScopeId,
+            kind: "system",
+            status: "completed",
+            countsForRun: false,
+            providerThreadId: parent.providerThread.id,
+            providerTurnId: null,
+            nativeItemRef: null,
+            runtimeRequestId: null,
+            checkpointScopeId: null,
+            startedAt: scopeTime,
+            completedAt: scopeTime,
+          },
+          {
+            nodeId: parentScopeId,
+            providerInstanceId: parentThreadEvent.payload.providerInstanceId,
+          },
+        ),
       ),
     );
   }
-  if (!run)
+  if (!runRoot)
     child.result.warnings.push(
       "Native child launch is unavailable in the selected parent history; thread lineage is preserved without inventing ownership by a parent run.",
     );
-  const status = child.conversation.turns[child.conversation.turns.length - 1]!.status;
-  const prompt = child.conversation.turns
-    .flatMap((turn) => turn.items)
-    .find((item) => item.kind === "user_message")?.data.text;
-  const lastAssistant = child.conversation.turns
-    .flatMap((turn) => turn.items)
-    .findLast((item) => item.kind === "assistant_message");
-  const result = typeof lastAssistant?.data.text === "string" ? lastAssistant.data.text : null;
+  const status = child.lastStatus;
+  const prompt = child.prompt();
+  const result = child.answer();
   const childThread = makeSubagentChildThread({
     parentThread: parentThreadEvent.payload,
     childThreadId: ThreadId.make(child.result.threadId),
@@ -1267,7 +1394,7 @@ function linkChildPlan(parent: Plan, child: Plan, allocator: IdAllocator.IdAlloc
     createdBy: "system",
     creationSource: "server",
   });
-  child.events[childThreadIndex] = nativeEvent(
+  child.creation = nativeEvent(
     child.result.threadId,
     "thread",
     "thread.created",
@@ -1282,9 +1409,9 @@ function linkChildPlan(parent: Plan, child: Plan, allocator: IdAllocator.IdAlloc
       settledAt: now,
     },
     { providerInstanceId: childThread.providerInstanceId },
-  );
+  ) as ThreadCreated;
   const common = {
-    ...(run ? { runId: run.id } : {}),
+    ...(runRoot ? { runId } : {}),
     nodeId,
     providerInstanceId: childThread.providerInstanceId,
   };
@@ -1296,8 +1423,7 @@ function linkChildPlan(parent: Plan, child: Plan, allocator: IdAllocator.IdAlloc
         strength: "strong",
       }
     : null;
-  const childEventsStart = parent.events.length;
-  parent.events.push(
+  const node = parent.recordEvent(
     nativeEvent(
       parent.result.threadId,
       `${key}:node`,
@@ -1306,7 +1432,7 @@ function linkChildPlan(parent: Plan, child: Plan, allocator: IdAllocator.IdAlloc
       {
         id: nodeId,
         threadId: parent.result.threadId,
-        runId: run?.id ?? null,
+        runId: runRoot ? runId : null,
         parentNodeId: parentScopeId,
         rootNodeId: parentScopeId,
         kind: "subagent",
@@ -1326,7 +1452,7 @@ function linkChildPlan(parent: Plan, child: Plan, allocator: IdAllocator.IdAlloc
   const subagent = {
     id: nodeId,
     threadId: parent.result.threadId,
-    runId: run?.id ?? null,
+    runId: runRoot ? runId : null,
     parentNodeId: parentScopeId,
     origin: "provider_native",
     createdBy: "agent",
@@ -1335,7 +1461,7 @@ function linkChildPlan(parent: Plan, child: Plan, allocator: IdAllocator.IdAlloc
     providerThreadId: child.providerThread.id,
     childThreadId: child.result.threadId,
     nativeTaskRef,
-    prompt: typeof prompt === "string" ? prompt : "",
+    prompt,
     title: child.conversation.title,
     model: child.conversation.model ?? null,
     modelSelection: childThread.modelSelection,
@@ -1345,7 +1471,7 @@ function linkChildPlan(parent: Plan, child: Plan, allocator: IdAllocator.IdAlloc
     completedAt: now,
     updatedAt: now,
   };
-  parent.events.push(
+  const link = parent.recordEvent(
     nativeEvent(
       parent.result.threadId,
       `${key}:subagent`,
@@ -1355,8 +1481,7 @@ function linkChildPlan(parent: Plan, child: Plan, allocator: IdAllocator.IdAlloc
       common,
     ),
   );
-  const turnItems = parent.events.filter((event) => event.type === "turn-item.updated");
-  parent.events.push(
+  const item = parent.recordEvent(
     nativeEvent(
       parent.result.threadId,
       `${key}:item`,
@@ -1365,16 +1490,13 @@ function linkChildPlan(parent: Plan, child: Plan, allocator: IdAllocator.IdAlloc
       {
         id: itemId,
         threadId: parent.result.threadId,
-        runId: run?.id ?? null,
+        runId: runRoot ? runId : null,
         nodeId,
         providerThreadId: parent.providerThread.id,
-        providerTurnId:
-          run && parentItem?.type === "turn-item.updated"
-            ? parentItem.payload.providerTurnId
-            : null,
+        providerTurnId: runRoot ? (parentItem?.providerTurnId ?? null) : null,
         nativeItemRef: nativeTaskRef,
-        parentItemId: parentItem?.type === "turn-item.updated" ? parentItem.payload.id : null,
-        ordinal: Math.max(0, ...turnItems.map((event) => event.payload.ordinal)) + 1,
+        parentItemId: parentItem?.id ?? null,
+        ordinal: parent.result.items + parent.detachedLinks.length + 1,
         type: "subagent",
         subagentId: nodeId,
         origin: "provider_native",
@@ -1392,20 +1514,27 @@ function linkChildPlan(parent: Plan, child: Plan, allocator: IdAllocator.IdAlloc
       common,
     ),
   );
-  if (parentItem?.type === "turn-item.updated") {
-    const insertions = (parent.childInsertions ??= new Map());
-    const group = insertions.get(parentItem.payload.id) ?? [];
-    group.push(...parent.events.splice(childEventsStart));
-    insertions.set(parentItem.payload.id, group);
+  if (parentItem) {
+    const group = parent.childInsertions.get(parentItem.id) ?? {
+      ordinal: parentItem.ordinal,
+      events: [],
+      links: [],
+    };
+    group.events.push(node, link, item);
+    group.links.push(link);
+    parent.childInsertions.set(parentItem.id, group);
+  } else {
+    parent.events.push(node, link, item);
+    parent.detachedLinks.push(link);
   }
 }
 
 export class NativeImportPlanError extends Error {}
 
-function flattenConversations(input: NativeConversation[]): NativeConversation[] {
-  const result: NativeConversation[] = [];
-  const ancestry = new Set<NativeConversation>();
-  const visit = (conversation: NativeConversation, parent?: NativeConversation) => {
+function flattenConversations(input: NativeConversationView[]): NativeConversationView[] {
+  const result: NativeConversationView[] = [];
+  const ancestry = new Set<NativeConversationView>();
+  const visit = (conversation: NativeConversationView, parent?: NativeConversationView) => {
     if (ancestry.has(conversation)) throw new NativeImportPlanError("Cyclic native child history.");
     if (parent && conversation.parent && conversation.parent.sourceId !== parent.id)
       throw new NativeImportPlanError("Native child declares a different parent.");
@@ -1438,7 +1567,11 @@ function readMarker(dbPath: string, sourceKey: string) {
   }
 }
 
-function planAll(conversations: NativeConversation[], options: NativeWriteOptions) {
+function planAll(
+  conversations: NativeConversationView[],
+  options: NativeWriteOptions,
+  spool?: HistorySpool,
+) {
   return Effect.gen(function* () {
     if (options.projectRoot !== undefined && options.projectId !== undefined)
       throw new NativeImportPlanError("Choose either --project-root or --project-id.");
@@ -1459,6 +1592,14 @@ function planAll(conversations: NativeConversation[], options: NativeWriteOption
       );
     const created = new Set<string>();
     const plans: Plan[] = [];
+    const launchIds = new Map<string, Set<string>>();
+    for (const { source, parent } of conversations) {
+      if (!parent?.nativeItemId) continue;
+      const key = `${source}:${parent.sourceId}`;
+      const ids = launchIds.get(key) ?? new Set<string>();
+      ids.add(parent.nativeItemId);
+      launchIds.set(key, ids);
+    }
     for (const conversation of conversations) {
       const projectRoot =
         selectedProject?.workspaceRoot ?? options.projectRoot ?? conversation.workspace;
@@ -1483,6 +1624,8 @@ function planAll(conversations: NativeConversation[], options: NativeWriteOption
         projectId,
         project?.workspaceRoot ?? projectRoot,
         project === undefined && !created.has(projectId),
+        launchIds.get(`${conversation.source}:${conversation.id}`),
+        spool,
       );
       if (options.resume && !effectiveOptions.resume)
         plan.result.warnings.push(
@@ -1495,6 +1638,7 @@ function planAll(conversations: NativeConversation[], options: NativeWriteOption
     }
     const linked = new Set<string>();
     const linking = new Set<string>();
+    const bySource = new Map(plans.map((plan) => [plan.sourceKey, plan]));
     const link = (plan: Plan): void => {
       if (linked.has(plan.sourceKey)) return;
       if (linking.has(plan.sourceKey))
@@ -1502,7 +1646,7 @@ function planAll(conversations: NativeConversation[], options: NativeWriteOption
       linking.add(plan.sourceKey);
       if (plan.conversation.parent) {
         const key = `${plan.conversation.source}:${plan.conversation.parent.sourceId}`;
-        const parent = plans.find((candidate) => candidate.sourceKey === key);
+        const parent = bySource.get(key);
         if (!parent)
           throw new NativeImportPlanError(
             `Native parent '${key}' must be included in this import.`,
@@ -1514,24 +1658,18 @@ function planAll(conversations: NativeConversation[], options: NativeWriteOption
       linked.add(plan.sourceKey);
     };
     plans.forEach(link);
-    // EventSink assigns native timeline positions in commit order. Commit each
-    // child immediately after its proven launch instead of appending it at run end.
-    for (const plan of plans)
-      if (plan.childInsertions)
-        plan.events = plan.events.flatMap((event) =>
-          event.type === "turn-item.updated"
-            ? [event, ...(plan.childInsertions!.get(event.payload.id) ?? [])]
-            : [event],
-        );
     for (const plan of plans) {
-      // Lineage and parent link records are part of the replay identity too.
-      plan.fingerprint = auditFingerprint({
-        source: plan.fingerprint,
-        relationships: plan.events.filter(
-          (event) => event.type === "subagent.updated" || event.type === "thread.created",
-        ),
-      });
       const marker = readMarker(paths(options.t3Home).db, plan.sourceKey);
+      // Lineage and parent link records are part of the replay identity too.
+      if (marker || !options.dryRun) {
+        const relationships = new HistoryList<DomainEvent>();
+        relationships.append(() => plan.creation);
+        const insertions = [...plan.childInsertions.values()].sort((a, b) => a.ordinal - b.ordinal);
+        for (const { links } of insertions)
+          for (const link of links) relationships.append(link.read);
+        for (const link of plan.detachedLinks) relationships.append(link.read);
+        plan.fingerprint = auditFingerprint({ source: plan.historyFingerprint(), relationships });
+      }
       const thread = yield* projections.findThread(ThreadId.make(plan.result.threadId));
       if (marker) {
         if (marker.fingerprint !== plan.fingerprint)
@@ -1560,7 +1698,7 @@ function planAll(conversations: NativeConversation[], options: NativeWriteOption
   });
 }
 
-function validateConversations(conversations: NativeConversation[]) {
+function validateConversations(conversations: NativeConversationView[]) {
   const seen = new Set<string>();
   if (!conversations.length)
     throw new NativeImportPlanError("Select at least one source conversation.");
@@ -1586,20 +1724,6 @@ function validateConversations(conversations: NativeConversation[]) {
       throw new NativeImportPlanError(`Source '${key}' has a mismatched native driver.`);
     if (!conversation.turns.length)
       throw new NativeImportPlanError(`Source '${key}' has no terminal history to import.`);
-    const turns = new Set<string>();
-    for (const turn of conversation.turns) {
-      if (!turn.id.trim() || turns.has(turn.id))
-        throw new NativeImportPlanError(`Duplicate or empty turn id in '${key}'.`);
-      turns.add(turn.id);
-      if (!["completed", "interrupted", "failed"].includes(turn.status))
-        throw new NativeImportPlanError(`Source '${key}' has a non-terminal turn.`);
-      const items = new Set<string>();
-      for (const item of turn.items) {
-        if (!item.id.trim() || items.has(item.id))
-          throw new NativeImportPlanError(`Duplicate or empty item id in turn '${turn.id}'.`);
-        items.add(item.id);
-      }
-    }
   }
 }
 
@@ -1644,13 +1768,13 @@ function stageAssets(plans: Plan[], directory: string) {
   try {
     for (const asset of assets.values()) {
       if (existsSync(asset.finalPath)) {
-        if (hash(readFileSync(asset.finalPath)) !== hash(asset.bytes))
+        if (hash(readFileSync(asset.finalPath)) !== asset.sha256)
           throw new Error(`Existing attachment differs from imported content: ${asset.finalPath}`);
         continue;
       }
       const staged = join(staging, basename(asset.finalPath));
-      writeFileSync(staged, asset.bytes, { flag: "wx", mode: 0o600 });
-      if (hash(readFileSync(staged)) !== hash(asset.bytes))
+      writeFileSync(staged, asset.read(), { flag: "wx", mode: 0o600 });
+      if (hash(readFileSync(staged)) !== asset.sha256)
         throw new Error("Attachment staging verification failed.");
       mkdirSync(dirname(asset.finalPath), { recursive: true, mode: 0o700 });
       renameSync(staged, asset.finalPath);
@@ -1668,19 +1792,11 @@ function auditEntry(value: unknown): NativeAuditEntry {
   const row = JSON.parse(JSON.stringify(value)) as Record<string, unknown>;
   return { id: String(row.id), fields: Object.keys(row).sort(), sha256: auditFingerprint(row) };
 }
-function createAuditManifest(plan: Plan, canonicalEvents: DomainEvent[]): NativeAuditManifest {
-  const created = canonicalEvents.find(
-    (event): event is Extract<DomainEvent, { type: "thread.created" }> =>
-      event.type === "thread.created",
-  );
-  if (!created) throw new Error("Native import audit requires its thread creation event.");
-  let threadProjection = ProjectionStore.emptyProjection(created);
-  for (const event of canonicalEvents)
-    if (
-      event !== created &&
-      (event.type.startsWith("thread.") || event.type.startsWith("provider-thread."))
-    )
-      threadProjection = ProjectionStore.applyToProjection(threadProjection, event);
+function createAuditManifest(
+  plan: Plan,
+  canonicalEvents: Iterable<DomainEvent>,
+): NativeAuditManifest {
+  let threadProjection = ProjectionStore.emptyProjection(plan.creation);
   const names: Record<string, string> = {
     "thread.created": "thread",
     "provider-thread.updated": "providerThreads",
@@ -1699,6 +1815,9 @@ function createAuditManifest(plan: Plan, canonicalEvents: DomainEvent[]): Native
   const children = new Set<string>(plan.childThreadIds ?? []);
   const warnings = [...plan.result.warnings];
   for (const event of canonicalEvents) {
+    if (event.type === "thread.created") continue;
+    if (event.type.startsWith("thread.") || event.type.startsWith("provider-thread."))
+      threadProjection = ProjectionStore.applyToProjection(threadProjection, event);
     const name = names[event.type];
     if (!name) continue;
     if (event.type === "turn-item.updated") {
@@ -1718,25 +1837,7 @@ function createAuditManifest(plan: Plan, canonicalEvents: DomainEvent[]): Native
       }
     } else {
       let payload: unknown = event.payload;
-      if (event.type === "thread.created") {
-        const fields = [
-          "id",
-          "projectId",
-          "title",
-          "modelSelection",
-          "providerInstanceId",
-          "worktreePath",
-          "lineage",
-          "forkedFrom",
-          "activeProviderThreadId",
-        ];
-        payload = Object.fromEntries(
-          fields.map((field) => [
-            field,
-            (threadProjection.thread as unknown as Record<string, unknown>)[field],
-          ]),
-        );
-      } else if (event.type === "provider-thread.updated") {
+      if (event.type === "provider-thread.updated") {
         const fields = ["id", "driver", "providerInstanceId", "appThreadId", "nativeThreadRef"];
         payload = Object.fromEntries(
           fields.map((field) => [
@@ -1751,6 +1852,21 @@ function createAuditManifest(plan: Plan, canonicalEvents: DomainEvent[]): Native
     if (event.type === "subagent.updated" && event.payload.childThreadId)
       children.add(event.payload.childThreadId);
   }
+  const threadFields = [
+    "id",
+    "projectId",
+    "title",
+    "modelSelection",
+    "providerInstanceId",
+    "worktreePath",
+    "lineage",
+    "forkedFrom",
+    "activeProviderThreadId",
+  ] as const;
+  const thread = auditEntry(
+    Object.fromEntries(threadFields.map((field) => [field, threadProjection.thread[field]])),
+  );
+  collections.get("thread")!.set(thread.id, thread);
   if (plan.escrowedFields)
     warnings.push(
       `metadata_only_fields: ${plan.escrowedFields} source fields are preserved outside T3's typed presentation.`,
@@ -1782,8 +1898,8 @@ function createAuditManifest(plan: Plan, canonicalEvents: DomainEvent[]): Native
           {
             name: basename(asset.finalPath),
             ...(asset.auditRelativePath ? { relativePath: asset.auditRelativePath } : {}),
-            sha256: hash(asset.bytes),
-            sizeBytes: asset.bytes.length,
+            sha256: asset.sha256,
+            sizeBytes: asset.sizeBytes,
           },
         ]),
       ).values(),
@@ -1820,7 +1936,7 @@ function resultFor(
 export async function withNativeImportRun<T>(
   options: NativeWriteOptions,
   run: (target: {
-    importBatch: (conversations: NativeConversation[]) => Promise<NativeImportResult>;
+    importBatch: (conversations: NativeConversationView[]) => Promise<NativeImportResult>;
     readonly backup: string | null;
     readonly path: string;
     readonly migration: number;
@@ -1871,14 +1987,14 @@ export async function withNativeImportRun<T>(
 }
 
 export async function importNativeConversations(
-  conversations: NativeConversation[],
+  conversations: NativeConversationView[],
   options: NativeWriteOptions,
 ): Promise<NativeImportResult> {
   return withNativeImportRun(options, (target) => target.importBatch(conversations));
 }
 
 async function writeNativeBatch(
-  conversations: NativeConversation[],
+  conversations: NativeConversationView[],
   options: NativeWriteOptions,
   migration: number,
   getBackup: () => Promise<string>,
@@ -1890,9 +2006,54 @@ async function writeNativeBatch(
         `Native selected records were not preserved for '${conversation.source}:${conversation.id}': ${conversation.sourceCoverage.missingRecordIds.join(", ")}`,
       );
   validateConversations(conversations);
+  const spool = conversations.some((conversation) => conversation.turns instanceof HistoryList)
+    ? new HistorySpool()
+    : undefined;
+  try {
+    return await writePlannedBatch(conversations, options, migration, getBackup, spool);
+  } finally {
+    spool?.close();
+  }
+}
+
+function* eventBatches(plan: Plan, staged: boolean): Generator<DomainEvent[]> {
+  let events: DomainEvent[] = [plan.creation];
+  let sizeBytes = 0;
+  for (const record of plan.events) {
+    const event = record.read();
+    // Keep each linked child immediately after its native launch in commit order.
+    const inserted =
+      event.type === "turn-item.updated" ? plan.childInsertions.get(event.payload.id) : undefined;
+    events.push(event);
+    sizeBytes += record.sizeBytes;
+    for (const child of inserted?.events ?? []) {
+      events.push(child.read());
+      sizeBytes += child.sizeBytes;
+      if (staged && (sizeBytes >= 16 * 1024 * 1024 || events.length >= 512)) {
+        yield events;
+        events = [];
+        sizeBytes = 0;
+      }
+    }
+    if (staged && (sizeBytes >= 16 * 1024 * 1024 || events.length >= 512)) {
+      yield events;
+      events = [];
+      sizeBytes = 0;
+    }
+  }
+  if (events.length) yield events;
+}
+
+async function writePlannedBatch(
+  conversations: NativeConversationView[],
+  options: NativeWriteOptions,
+  migration: number,
+  getBackup: () => Promise<string>,
+  spool?: HistorySpool,
+): Promise<NativeImportResult> {
   const p = paths(options.t3Home);
   const plans = await Effect.runPromise(
-    planAll(conversations, options).pipe(Effect.provide(runtimeLayer(p.db, true))),
+    planAll(conversations, options, spool).pipe(Effect.provide(runtimeLayer(p.db, true))),
   );
   const pending = plans.filter((plan) => plan.result.status !== "already-imported");
   if (options.dryRun || !pending.length)
@@ -1925,6 +2086,11 @@ async function writeNativeBatch(
                 yield* sql`CREATE TABLE IF NOT EXISTS t3_native_import_metadata (
             thread_id TEXT PRIMARY KEY, records_json TEXT NOT NULL
           )`;
+                if (spool)
+                  yield* sql`CREATE TABLE IF NOT EXISTS t3_native_import_metadata_records (
+              thread_id TEXT NOT NULL, record_index INTEGER NOT NULL, record_json TEXT NOT NULL,
+              PRIMARY KEY (thread_id, record_index)
+            )`;
                 yield* sql`CREATE TABLE IF NOT EXISTS t3_native_import_audits (thread_id TEXT PRIMARY KEY, report_json TEXT NOT NULL)`;
                 for (const plan of pending) {
                   if (plan.projectEvent) {
@@ -1938,48 +2104,55 @@ async function writeNativeBatch(
                       event: plan.projectEvent,
                     });
                   }
-                  const sourceItemShapes = new Map(
-                    plan.events
-                      .filter((event) => event.type === "turn-item.updated")
-                      .map((event) => {
-                        const { ordinal: _ordinal, ...content } = event.payload;
-                        return [String(event.id), auditFingerprint(content)] as const;
-                      }),
-                  );
-                  const stored = yield* sink.write({
-                    ...(plan.runtime ? { unlessNativeThreadOwned: plan.providerThread } : {}),
-                    events: plan.events,
-                  });
-                  if (!stored.length)
-                    throw new Error(
-                      `Native session '${plan.sourceKey}' already belongs to another T3 thread.`,
+                  const canonicalEvents = new HistoryList<DomainEvent>();
+                  for (const events of eventBatches(plan, spool !== undefined)) {
+                    const sourceItemShapes = new Map(
+                      events
+                        .filter((event) => event.type === "turn-item.updated")
+                        .map((event) => {
+                          const { ordinal: _ordinal, ...content } = event.payload;
+                          return [String(event.id), auditFingerprint(content)] as const;
+                        }),
                     );
-                  // T3 owns run-scoped item positions. Reuse its canonical events,
-                  // and fail closed if native normalization changes source content.
-                  for (const row of stored)
-                    if (row.event.type === "turn-item.updated") {
-                      const expected = sourceItemShapes.get(String(row.event.id));
-                      const { ordinal: _ordinal, ...content } = row.event.payload;
-                      if (expected && expected !== auditFingerprint(content))
-                        throw new Error(
-                          `Native T3 normalization changed source-owned item fields: ${row.event.payload.nativeItemRef?.nativeId ?? row.event.payload.id}`,
-                        );
+                    const stored = yield* sink.write({
+                      ...(plan.runtime ? { unlessNativeThreadOwned: plan.providerThread } : {}),
+                      events,
+                    });
+                    if (!stored.length)
+                      throw new Error(
+                        `Native session '${plan.sourceKey}' already belongs to another T3 thread.`,
+                      );
+                    // T3 owns run-scoped item positions. Reuse its canonical events,
+                    // and fail closed if native normalization changes source content.
+                    for (const { event } of stored) {
+                      if (event.type === "turn-item.updated") {
+                        const expected = sourceItemShapes.get(String(event.id));
+                        const { ordinal: _ordinal, ...content } = event.payload;
+                        if (expected && expected !== auditFingerprint(content))
+                          throw new Error(
+                            `Native T3 normalization changed source-owned item fields: ${event.payload.nativeItemRef?.nativeId ?? event.payload.id}`,
+                          );
+                      }
+                      canonicalEvents.append(plan.recordEvent(event).read);
                     }
+                  }
                   if (plan.runtime) yield* runtimes.upsert(plan.runtime, { onConflict: "ignore" });
                   const latest = yield* eventStore.latestSequence({
                     threadId: ThreadId.make(plan.result.threadId),
                   });
                   yield* sql`INSERT INTO t3_native_imports (source_key, fingerprint, thread_id, last_sequence, imported_at)
               VALUES (${plan.sourceKey}, ${plan.fingerprint}, ${plan.result.threadId}, ${latest}, ${new Date().toISOString()})`;
-                  if (plan.metadata.length)
+                  if (spool) {
+                    let index = 0;
+                    for (const record of plan.metadata)
+                      yield* sql`INSERT INTO t3_native_import_metadata_records (thread_id, record_index, record_json)
+                VALUES (${plan.result.threadId}, ${index++}, ${JSON.stringify(record)})`;
+                  } else if (plan.metadata.length)
                     yield* sql`INSERT INTO t3_native_import_metadata (thread_id, records_json)
-              VALUES (${plan.result.threadId}, ${JSON.stringify(plan.metadata)})`;
+              VALUES (${plan.result.threadId}, ${JSON.stringify(Array.from(plan.metadata))})`;
                   yield* sql`INSERT INTO t3_native_import_audits (thread_id, report_json)
               VALUES (${plan.result.threadId}, ${JSON.stringify(
-                createAuditManifest(
-                  plan,
-                  stored.map((row) => row.event),
-                ),
+                createAuditManifest(plan, canonicalEvents),
               )})`;
                 }
               }),

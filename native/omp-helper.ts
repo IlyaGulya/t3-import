@@ -1,10 +1,11 @@
 /** Runs under Bun so the installed OMP package executes its own native session implementation. */
 import { createReadStream } from "node:fs";
-import { access, readFile, realpath, stat } from "node:fs/promises";
+import { access, readFile, readdir, realpath, stat } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { writeNativeJson } from "./json-output.js";
+import { sendOmpFrame } from "./omp-transport.js";
 import type {
   NativeConversation,
   NativeHistoryItem,
@@ -26,7 +27,7 @@ import type * as EntryModule from "@oh-my-pi/pi-coding-agent/session/session-ent
 import type * as Manager from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type * as Context from "@oh-my-pi/pi-coding-agent/session/session-context";
 import type * as Blobs from "@oh-my-pi/pi-coding-agent/session/blob-store";
-import type * as SubSessions from "@oh-my-pi/pi-coding-agent/session/sub-sessions";
+import type * as Tombstones from "@oh-my-pi/pi-coding-agent/registry/agent-tombstone";
 import type * as SelectiveCommit from "@oh-my-pi/pi-coding-agent/commit/selective/journal";
 import type * as Exit from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
 import type * as Dirs from "@oh-my-pi/pi-utils/dirs";
@@ -91,13 +92,13 @@ function taskLaunchItems(conversation: NativeConversation): Map<string, string |
   return launches;
 }
 
-function moveEmptySubsessionsToMetadata(owner: NativeConversation): void {
+function moveEmptySubsessionsToMetadata(owner: NativeConversation, streamed: Set<string>): void {
   if (!owner.children?.length) return;
   owner.children = owner.children.filter((child) => {
-    moveEmptySubsessionsToMetadata(child);
+    moveEmptySubsessionsToMetadata(child, streamed);
     if (
       child.active ||
-      child.turns.length ||
+      streamed.has(child.id) ||
       child.children?.length ||
       child.sourceCoverage?.selectedRecords !== 0
     )
@@ -155,7 +156,66 @@ async function snapshot(path: string): Promise<string> {
   return `${key(after)}:${hash.digest("hex")}`;
 }
 
-async function execute(request: Request): Promise<NativeSourceSummary[] | NativeConversation> {
+interface ChildTranscript {
+  key: string;
+  agentId: string;
+  parent: string | null;
+  path: string;
+  aborted: boolean;
+}
+
+async function childTranscripts(
+  root: string,
+  tombstonePath: typeof Tombstones.getAgentTombstonePath,
+): Promise<ChildTranscript[]> {
+  const transcripts: ChildTranscript[] = [];
+  const visit = async (directory: string, parent: string | null) => {
+    const dirents = await readdir(directory, { withFileTypes: true }).catch(
+      (error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT" || error.code === "ENOTDIR") return [];
+        throw error;
+      },
+    );
+    const files = new Set(dirents.filter((entry) => entry.isFile()).map((entry) => entry.name));
+    const directories = new Set(
+      dirents.filter((entry) => entry.isDirectory()).map((entry) => entry.name),
+    );
+    for (const name of files) {
+      const compressed = name.endsWith(".jsonl.gz");
+      const plainName = compressed ? name.slice(0, -3) : name;
+      // Match native collectSubSessions' read-only export scope. The collector
+      // itself retains every decoded transcript, so enumerate paths here.
+      if (
+        !plainName.endsWith(".jsonl") ||
+        name.includes(".bak") ||
+        (compressed && files.has(plainName))
+      )
+        continue;
+      const agentId = plainName.slice(0, -6);
+      const key = parent ? `${parent}/${agentId}` : agentId;
+      transcripts.push({
+        key,
+        agentId,
+        parent,
+        path: join(directory, name),
+        aborted:
+          files.has(tombstonePath(plainName)) || (compressed && files.has(tombstonePath(name))),
+      });
+      if (directories.has(agentId)) await visit(join(directory, agentId), key);
+    }
+  };
+  await visit(root, null);
+  return transcripts.sort((a, b) => a.key.localeCompare(b.key));
+}
+
+async function childSnapshot(transcripts: ChildTranscript[]): Promise<string> {
+  const digest = createHash("sha256");
+  for (const child of transcripts)
+    digest.update(JSON.stringify([child.path, child.aborted, await snapshot(child.path)]));
+  return digest.digest("hex");
+}
+
+async function execute(request: Request): Promise<NativeSourceSummary[] | undefined> {
   if (
     !request ||
     !["list", "read"].includes(request.operation) ||
@@ -195,7 +255,6 @@ async function execute(request: Request): Promise<NativeSourceSummary[] | Native
     contextModule,
     blobs,
     exit,
-    subSessions,
   ] = await Promise.all([
     module<typeof Loader>("session-loader"),
     module<typeof Listing>("session-listing"),
@@ -206,7 +265,6 @@ async function execute(request: Request): Promise<NativeSourceSummary[] | Native
     module<typeof Context>("session-context"),
     module<typeof Blobs>("blob-store"),
     module<typeof Exit>("exit-diagnostics"),
-    module<typeof SubSessions>("sub-sessions"),
   ]);
   const [dirs, transcript] = await Promise.all([
     import(
@@ -233,7 +291,6 @@ async function execute(request: Request): Promise<NativeSourceSummary[] | Native
     [transcript, "transcriptEntryMessage"],
     [exit, "sessionExitFollowsLastMessage"],
     [exit, "collectPendingToolCalls"],
-    [subSessions, "collectSubSessions"],
   ] as const) {
     if (typeof Reflect.get(object, name) !== "function")
       throw new Error(
@@ -342,6 +399,12 @@ async function execute(request: Request): Promise<NativeSourceSummary[] | Native
   const archived = compressed && inside(archiveRoot, path);
   if (options.archived && !archived) throw new Error("OMP session is outside the cold archive.");
   const before = await snapshot(path);
+  const { getAgentTombstonePath } = (await import(
+    pathToFileURL(join(request.packageRoot, "src/registry/agent-tombstone.ts")).href
+  )) as typeof Tombstones;
+  const childRoot = path.slice(0, compressed ? -9 : -6);
+  const childFiles = await childTranscripts(childRoot, getAgentTombstonePath);
+  const originalChildren = await childSnapshot(childFiles);
   const loaded = compressed
     ? await readCompressed(path)
     : await loader.loadSessionFile(path, storage, { throwIfMissing: true });
@@ -995,55 +1058,60 @@ async function execute(request: Request): Promise<NativeSourceSummary[] | Native
     source = { ...summarize(info), ...(inside(sessionsRoot, path) ? { archived: false } : {}) };
   }
   const result = await normalizeHistory(loaded.entries, source, path);
+  loaded.entries.length = 0;
   if (compressed) result.resumeSupported = false;
-  const collect = async () => {
-    let needsJournalCheck = false;
-    const records = await subSessions.collectSubSessions(path, {
-      includeCompressed: true,
-      includeAdvisors: true,
-      onUnreadable(key) {
-        if (key === "changes") {
-          needsJournalCheck = true;
-          return;
-        }
-        throw new Error(
-          `OMP native child '${key}' has an unreadable session header; refusing partial family history.`,
-        );
-      },
-    });
-    if (needsJournalCheck) {
-      const { ChangeJournal } = (await import(
-        pathToFileURL(join(request.packageRoot, "src/commit/selective/journal.ts")).href
-      )) as typeof SelectiveCommit;
-      const journal = await ChangeJournal.at(path.slice(0, compressed ? -9 : -6)).read();
-      if (
-        journal.length === 0 ||
-        !journal.every(
-          (entry) =>
-            entry &&
-            typeof entry.agent === "string" &&
-            ["change", "call", "commit"].includes(entry.type),
-        )
-      )
-        throw new Error(
-          "OMP native child 'changes' has an unreadable session header and is not a native change journal.",
-        );
+  const streamed = new Set<string>();
+  const launchesByOwner = new Map<string, ReturnType<typeof taskLaunchItems>>();
+  const streamBody = async (conversation: NativeConversation) => {
+    if (!conversation.turns.length) return;
+    streamed.add(conversation.id);
+    launchesByOwner.set(conversation.id, taskLaunchItems(conversation));
+    for (const { items, ...turn } of conversation.turns) {
+      await sendOmpFrame({ type: "turn", id: conversation.id, turn, items: items.length });
+      for (const item of items) await sendOmpFrame({ type: "item", item });
     }
-    return records;
+    for (const record of conversation.nativeMetadata ?? [])
+      await sendOmpFrame({ type: "metadata", id: conversation.id, record });
+    conversation.turns = [];
+    conversation.nativeMetadata = [];
   };
-  const signature = (records: Record<string, SubSessions.SubSession>): string => {
-    const digest = createHash("sha256");
-    for (const [key, record] of Object.entries(records).sort(([a], [b]) => a.localeCompare(b)))
-      digest.update(JSON.stringify([key, record]));
-    return digest.digest("hex");
+  await streamBody(result);
+  const checkJournal = async () => {
+    const { ChangeJournal } = (await import(
+      pathToFileURL(join(request.packageRoot, "src/commit/selective/journal.ts")).href
+    )) as typeof SelectiveCommit;
+    const journal = await ChangeJournal.at(childRoot).read();
+    if (
+      journal.length === 0 ||
+      !journal.every(
+        (entry) =>
+          entry &&
+          typeof entry.agent === "string" &&
+          ["change", "call", "commit"].includes(entry.type),
+      )
+    )
+      throw new Error(
+        "OMP native child 'changes' has an unreadable session header and is not a native change journal.",
+      );
   };
-  let collected = await collect();
-  const originalChildren = signature(collected);
   const children = new Map<string, NativeConversation>();
-  const childAgentIds = new Map<string, string>();
   const nativeIds = new Map<NativeConversation, string>([[result, header.id]]);
-  for (const [key, record] of Object.entries(collected).sort(([a], [b]) => a.localeCompare(b))) {
-    if (!record.header || typeof record.header.cwd !== "string")
+  for (const { key, agentId, parent, path: childPath, aborted } of childFiles) {
+    const record = childPath.endsWith(".jsonl.gz")
+      ? await readCompressed(childPath)
+      : await loader.loadSessionFile(childPath, storage, { throwIfMissing: true });
+    if (record.invalidHeader) {
+      if (key === "changes") {
+        await checkJournal();
+        continue;
+      }
+      throw new Error(
+        `OMP native child '${key}' has an unreadable session header; refusing partial family history.`,
+      );
+    }
+    if (!record.entries.length) continue;
+    const childHeader = record.entries.find((entry) => entry.type === "session");
+    if (!childHeader || typeof childHeader.cwd !== "string")
       throw new Error(
         `OMP native child '${key}' has no usable header; refusing partial family history.`,
       );
@@ -1051,50 +1119,44 @@ async function execute(request: Request): Promise<NativeSourceSummary[] | Native
       throw new Error(
         `OMP native child '${key}' contains ${record.malformedRecords} malformed record(s); refusing partial family history.`,
       );
-    let childPath = join(path.slice(0, compressed ? -9 : -6), `${key}.jsonl`);
-    try {
-      await access(childPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      childPath += ".gz";
-      await access(childPath);
-    }
-    const nativeHeader = json(record.header);
+    const entries = record.entries.filter((entry) => entry.type !== "session");
+    const nativeHeader = json(childHeader);
     const child = await normalizeHistory(
-      [record.header, ...record.entries],
+      [childHeader, ...entries],
       {
         source: "omp",
         id: `${result.id}:agent:${key}`,
-        title: record.header.title || `OMP ${record.agentId}`,
-        workspace: record.header.cwd,
-        createdAt: iso(record.header.timestamp),
-        updatedAt: iso(record.entries.at(-1)?.timestamp, iso(record.header.timestamp)),
+        title: childHeader.title || `OMP ${agentId}`,
+        workspace: childHeader.cwd,
+        createdAt: iso(childHeader.timestamp),
+        updatedAt: iso(entries.at(-1)?.timestamp, iso(childHeader.timestamp)),
         path: childPath,
         ...(archived ? { archived: true } : {}),
       },
       childPath,
-      record.aborted,
+      aborted,
     );
     child.resumeSupported = false;
-    child.parent = { sourceId: record.parent ? `${result.id}:agent:${record.parent}` : result.id };
+    child.parent = { sourceId: parent ? `${result.id}:agent:${parent}` : result.id };
     child.nativeMetadata = [
       ...(child.nativeMetadata ?? []),
       json({
         type: "omp_subsession",
         key,
-        parent: record.parent,
+        parent,
         header: nativeHeader,
-        aborted: record.aborted,
+        aborted,
       }),
     ];
+    record.entries.length = 0;
+    await streamBody(child);
     children.set(key, child);
-    childAgentIds.set(key, record.agentId);
-    nativeIds.set(child, record.header.id);
+    nativeIds.set(child, childHeader.id);
   }
-  // Native loaders own discovery, decompression and parsing; re-reading through
-  // that same API detects changing/added/deleted children without a second parser.
-  collected = {};
-  if (originalChildren !== signature(await collect()))
+  if (
+    originalChildren !==
+    (await childSnapshot(await childTranscripts(childRoot, getAgentTombstonePath)))
+  )
     throw new Error(
       "OMP native child history changed while reading; refusing an inconsistent family snapshot.",
     );
@@ -1102,19 +1164,15 @@ async function execute(request: Request): Promise<NativeSourceSummary[] | Native
     [result.id, result],
     ...[...children.values()].map((child) => [child.id, child] as const),
   ]);
-  const launchesByOwner = new Map<string, ReturnType<typeof taskLaunchItems>>();
-  for (const [key, child] of children) {
+  for (const { key, agentId } of childFiles) {
+    const child = children.get(key);
+    if (!child) continue;
     const owner = owners.get(child.parent!.sourceId);
     if (!owner)
       throw new Error(
         `OMP native child '${key}' names an unavailable parent; refusing incomplete lineage.`,
       );
-    let launches = launchesByOwner.get(owner.id);
-    if (!launches) {
-      launches = taskLaunchItems(owner);
-      launchesByOwner.set(owner.id, launches);
-    }
-    const nativeItemId = launches.get(childAgentIds.get(key)!);
+    const nativeItemId = launchesByOwner.get(owner.id)?.get(agentId);
     if (nativeItemId) child.parent!.nativeItemId = nativeItemId;
     (owner.children ??= []).push(child);
   }
@@ -1132,21 +1190,38 @@ async function execute(request: Request): Promise<NativeSourceSummary[] | Native
     );
   }
   // The final native lease check must run before omitting an empty transcript.
-  moveEmptySubsessionsToMetadata(result);
-  return result;
+  moveEmptySubsessionsToMetadata(result, streamed);
+  const family = [result];
+  let count = 0;
+  while (family.length) {
+    const { turns: _turns, children, nativeMetadata, ...head } = family.pop()!;
+    for (const record of nativeMetadata ?? [])
+      await sendOmpFrame({ type: "metadata", id: head.id, record });
+    await sendOmpFrame({
+      type: "conversation",
+      head,
+      ...(children ? { children: children.map((child) => child.id) } : {}),
+    });
+    count++;
+    if (children) family.push(...children);
+  }
+  await sendOmpFrame({ type: "complete", root: result.id, count });
 }
 
-// stdout is a single transport response; diagnostics from the native package stay on stderr.
+// stdout is private transport; diagnostics from the native package stay on stderr.
 const nativeLog = console.log;
 console.log = (...values) => console.error(...values);
+let reading = false;
 try {
   const input = await Bun.stdin.text();
-  const value = await execute(JSON.parse(input));
-  await writeNativeJson({ ok: true, value }, false);
+  const request = JSON.parse(input) as Request;
+  reading = request.operation === "read";
+  const value = await execute(request);
+  if (!reading) await writeNativeJson({ ok: true, value }, false);
 } catch (error) {
-  process.stdout.write(
-    JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }),
-  );
+  const message = error instanceof Error ? error.message : String(error);
+  if (reading) await sendOmpFrame({ type: "error", error: message });
+  else await writeNativeJson({ ok: false, error: message }, false);
 } finally {
   console.log = nativeLog;
 }

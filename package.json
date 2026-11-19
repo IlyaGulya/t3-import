@@ -1,6 +1,6 @@
 {
   "name": "@ilyagulya/t3-import",
-  "version": "0.5.0-native.13",
+  "version": "0.5.0-native.14",
   "description": "Import Codex, Claude Code and Oh My Pi history using native readers and T3 orchestration",
   "keywords": [
     "claude-code",
