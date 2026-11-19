@@ -1387,13 +1387,15 @@ function linkChildPlan(parent: Plan, child: Plan, allocator: IdAllocator.IdAlloc
   }
 }
 
+export class NativeImportPlanError extends Error {}
+
 function flattenConversations(input: NativeConversation[]): NativeConversation[] {
   const result: NativeConversation[] = [];
   const ancestry = new Set<NativeConversation>();
   const visit = (conversation: NativeConversation, parent?: NativeConversation) => {
-    if (ancestry.has(conversation)) throw new Error("Cyclic native child history.");
+    if (ancestry.has(conversation)) throw new NativeImportPlanError("Cyclic native child history.");
     if (parent && conversation.parent && conversation.parent.sourceId !== parent.id)
-      throw new Error("Native child declares a different parent.");
+      throw new NativeImportPlanError("Native child declares a different parent.");
     ancestry.add(conversation);
     result.push({
       ...conversation,
@@ -1426,9 +1428,9 @@ function readMarker(dbPath: string, sourceKey: string) {
 function planAll(conversations: NativeConversation[], options: NativeWriteOptions) {
   return Effect.gen(function* () {
     if (options.projectRoot !== undefined && options.projectId !== undefined)
-      throw new Error("Choose either --project-root or --project-id.");
+      throw new NativeImportPlanError("Choose either --project-root or --project-id.");
     if (options.projectRoot !== undefined && !options.projectRoot.trim())
-      throw new Error("Project root must not be empty.");
+      throw new NativeImportPlanError("Project root must not be empty.");
     const allocator = yield* IdAllocator.IdAllocatorV2;
     const projects = yield* ProjectStore.ProjectStoreV2;
     const projections = yield* ProjectionStore.ProjectionStoreV2;
@@ -1439,7 +1441,7 @@ function planAll(conversations: NativeConversation[], options: NativeWriteOption
         ? undefined
         : activeProjects.find((project) => project.projectId === options.projectId);
     if (options.projectId !== undefined && !selectedProject)
-      throw new Error(
+      throw new NativeImportPlanError(
         `T3 project '${options.projectId}' was not found or is deleted. Use the projects command to list destination projects.`,
       );
     const created = new Set<string>();
@@ -1452,7 +1454,7 @@ function planAll(conversations: NativeConversation[], options: NativeWriteOption
         (project) => workspaceKey(project.workspaceRoot) === workspace,
       );
       if (!selectedProject && matches.length > 1)
-        throw new Error(
+        throw new NativeImportPlanError(
           `Multiple T3 projects share directory '${projectRoot}'; choose --project-id explicitly.`,
         );
       const project = selectedProject ?? matches[0];
@@ -1483,12 +1485,15 @@ function planAll(conversations: NativeConversation[], options: NativeWriteOption
     const link = (plan: Plan): void => {
       if (linked.has(plan.sourceKey)) return;
       if (linking.has(plan.sourceKey))
-        throw new Error(`Cyclic native parent relation for '${plan.sourceKey}'.`);
+        throw new NativeImportPlanError(`Cyclic native parent relation for '${plan.sourceKey}'.`);
       linking.add(plan.sourceKey);
       if (plan.conversation.parent) {
         const key = `${plan.conversation.source}:${plan.conversation.parent.sourceId}`;
         const parent = plans.find((candidate) => candidate.sourceKey === key);
-        if (!parent) throw new Error(`Native parent '${key}' must be included in this import.`);
+        if (!parent)
+          throw new NativeImportPlanError(
+            `Native parent '${key}' must be included in this import.`,
+          );
         link(parent);
         linkChildPlan(parent, plan, allocator);
       }
@@ -1517,23 +1522,23 @@ function planAll(conversations: NativeConversation[], options: NativeWriteOption
       const thread = yield* projections.findThread(ThreadId.make(plan.result.threadId));
       if (marker) {
         if (marker.fingerprint !== plan.fingerprint)
-          throw new Error(
+          throw new NativeImportPlanError(
             `Imported source '${plan.sourceKey}' changed. Native sync/replace is not implemented; history was not overwritten.`,
           );
         if (!thread || marker.thread_id !== plan.result.threadId || thread.deletedAt !== null)
-          throw new Error(
+          throw new NativeImportPlanError(
             `Imported target '${plan.sourceKey}' was deleted or rebound; refusing to recreate it.`,
           );
         const latest = yield* eventStore.latestSequence({
           threadId: ThreadId.make(plan.result.threadId),
         });
         if (latest !== marker.last_sequence)
-          throw new Error(
+          throw new NativeImportPlanError(
             `Imported target '${plan.sourceKey}' contains newer T3 activity; history was not overwritten.`,
           );
         plan.result.status = "already-imported";
       } else if (thread) {
-        throw new Error(
+        throw new NativeImportPlanError(
           `Target thread '${plan.result.threadId}' already exists without this importer's marker.`,
         );
       }
@@ -1544,13 +1549,14 @@ function planAll(conversations: NativeConversation[], options: NativeWriteOption
 
 function validateConversations(conversations: NativeConversation[]) {
   const seen = new Set<string>();
-  if (!conversations.length) throw new Error("Select at least one source conversation.");
+  if (!conversations.length)
+    throw new NativeImportPlanError("Select at least one source conversation.");
   for (const conversation of conversations) {
     const key = `${conversation.source}:${conversation.id}`;
-    if (seen.has(key)) throw new Error(`Duplicate source conversation '${key}'.`);
+    if (seen.has(key)) throw new NativeImportPlanError(`Duplicate source conversation '${key}'.`);
     seen.add(key);
     if (conversation.active)
-      throw new Error(
+      throw new NativeImportPlanError(
         `Source '${key}' has an active or indeterminate turn; settle it before importing.`,
       );
     if (
@@ -1558,26 +1564,26 @@ function validateConversations(conversations: NativeConversation[]) {
       !conversation.nativeSessionRef.trim() ||
       !conversation.workspace.trim()
     )
-      throw new Error(`Source '${key}' lacks its stable identity or workspace.`);
+      throw new NativeImportPlanError(`Source '${key}' lacks its stable identity or workspace.`);
     if (
       (conversation.source === "codex" && conversation.driver !== "codex") ||
       (conversation.source === "omp" && conversation.driver !== "pi") ||
       (conversation.source === "claude" && conversation.driver !== "claudeAgent")
     )
-      throw new Error(`Source '${key}' has a mismatched native driver.`);
+      throw new NativeImportPlanError(`Source '${key}' has a mismatched native driver.`);
     if (!conversation.turns.length)
-      throw new Error(`Source '${key}' has no terminal history to import.`);
+      throw new NativeImportPlanError(`Source '${key}' has no terminal history to import.`);
     const turns = new Set<string>();
     for (const turn of conversation.turns) {
       if (!turn.id.trim() || turns.has(turn.id))
-        throw new Error(`Duplicate or empty turn id in '${key}'.`);
+        throw new NativeImportPlanError(`Duplicate or empty turn id in '${key}'.`);
       turns.add(turn.id);
       if (!["completed", "interrupted", "failed"].includes(turn.status))
-        throw new Error(`Source '${key}' has a non-terminal turn.`);
+        throw new NativeImportPlanError(`Source '${key}' has a non-terminal turn.`);
       const items = new Set<string>();
       for (const item of turn.items) {
         if (!item.id.trim() || items.has(item.id))
-          throw new Error(`Duplicate or empty item id in turn '${turn.id}'.`);
+          throw new NativeImportPlanError(`Duplicate or empty item id in turn '${turn.id}'.`);
         items.add(item.id);
       }
     }
@@ -1591,19 +1597,25 @@ async function verifiedBackup(dbPath: string): Promise<string> {
     directory,
     `statev2-native-${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID()}.sqlite`,
   );
+  const staging = `${destination}.partial`;
   const source = new DatabaseSync(dbPath, { readOnly: true });
+  // Node 26 can leave SQLite backup promise callbacks pending while a native reader's pipes are idle.
+  const wakeBackup = setInterval(() => {}, 250).unref();
   try {
-    await backup(source, destination);
+    await backup(source, staging);
+    chmodSync(staging, 0o600);
+    const check = new DatabaseSync(staging, { readOnly: true });
+    try {
+      if (Object.values(check.prepare("PRAGMA integrity_check").get() ?? {})[0] !== "ok")
+        throw new Error(`Backup integrity check failed: ${destination}`);
+    } finally {
+      check.close();
+    }
+    renameSync(staging, destination);
   } finally {
+    clearInterval(wakeBackup);
     source.close();
-  }
-  chmodSync(destination, 0o600);
-  const check = new DatabaseSync(destination, { readOnly: true });
-  try {
-    if (Object.values(check.prepare("PRAGMA integrity_check").get() ?? {})[0] !== "ok")
-      throw new Error(`Backup integrity check failed: ${destination}`);
-  } finally {
-    check.close();
+    rmSync(staging, { force: true });
   }
   return destination;
 }
@@ -1792,45 +1804,89 @@ function resultFor(
   };
 }
 
-export async function importNativeConversations(
-  conversations: NativeConversation[],
+export async function withNativeImportRun<T>(
   options: NativeWriteOptions,
-): Promise<NativeImportResult> {
-  conversations = flattenConversations(conversations);
-  for (const conversation of conversations)
-    if (conversation.sourceCoverage?.missingRecordIds.length)
-      throw new Error(
-        `Native selected records were not preserved for '${conversation.source}:${conversation.id}': ${conversation.sourceCoverage.missingRecordIds.join(", ")}`,
-      );
-  validateConversations(conversations);
+  run: (target: {
+    importBatch: (conversations: NativeConversation[]) => Promise<NativeImportResult>;
+    readonly backup: string | null;
+    readonly path: string;
+    readonly migration: number;
+  }) => Promise<T>,
+): Promise<T> {
   const p = paths(options.t3Home);
   if (options.initialize && !existsSync(p.db)) {
     if (options.dryRun) throw new Error("Dry-run never initializes a missing target.");
     await initializeNativeTarget(options.t3Home);
   }
-  const inspection = inspectNativeTarget(options.t3Home);
-  if (!inspection.supported || inspection.migration === null)
-    throw new Error(inspection.reason ?? "Unsupported T3 target.");
-  if (inspection.live && !options.dryRun)
+  if (!options.dryRun && liveRuntime(p.runtime))
     throw new Error("T3 is running. Close it before importing with the offline native writer.");
-  const preview = await Effect.runPromise(
-    planAll(conversations, options).pipe(Effect.provide(runtimeLayer(p.db, true))),
-  );
-  if (options.dryRun || preview.every((plan) => plan.result.status === "already-imported"))
-    return resultFor(preview, p.db, inspection.migration, options.dryRun, null);
+  if (!existsSync(p.db))
+    throw new Error("T3 V2 database is missing; start this T3 home once before importing.");
+
+  const execute = async () => {
+    const inspection = inspectNativeTarget(options.t3Home);
+    if (inspection.live && !options.dryRun)
+      throw new Error("T3 is running. Close it before importing with the offline native writer.");
+    if (!inspection.supported || inspection.migration === null)
+      throw new Error(inspection.reason ?? "Unsupported T3 target.");
+    const migration = inspection.migration;
+    let savedBackup: string | null = null;
+    let pendingBackup: Promise<string> | undefined;
+    return run({
+      path: p.db,
+      migration,
+      importBatch: (conversations) =>
+        writeNativeBatch(conversations, options, migration, () => {
+          return (pendingBackup ??= verifiedBackup(p.db).then((path) => (savedBackup = path)));
+        }),
+      get backup() {
+        return savedBackup;
+      },
+    });
+  };
+
+  if (options.dryRun) return execute();
   return Effect.runPromise(
     Effect.gen(function* () {
       yield* holdServerOwnershipLock(p.runtime);
-      if (liveRuntime(p.runtime))
-        throw new Error("T3 started while preparing import. Close it and retry.");
-      const plans = yield* Effect.promise(() =>
-        Effect.runPromise(
-          planAll(conversations, options).pipe(Effect.provide(runtimeLayer(p.db, true))),
-        ),
+      return yield* Effect.tryPromise({
+        try: execute,
+        catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+      });
+    }).pipe(Effect.scoped),
+  );
+}
+
+export async function importNativeConversations(
+  conversations: NativeConversation[],
+  options: NativeWriteOptions,
+): Promise<NativeImportResult> {
+  return withNativeImportRun(options, (target) => target.importBatch(conversations));
+}
+
+async function writeNativeBatch(
+  conversations: NativeConversation[],
+  options: NativeWriteOptions,
+  migration: number,
+  getBackup: () => Promise<string>,
+): Promise<NativeImportResult> {
+  conversations = flattenConversations(conversations);
+  for (const conversation of conversations)
+    if (conversation.sourceCoverage?.missingRecordIds.length)
+      throw new NativeImportPlanError(
+        `Native selected records were not preserved for '${conversation.source}:${conversation.id}': ${conversation.sourceCoverage.missingRecordIds.join(", ")}`,
       );
-      const pending = plans.filter((plan) => plan.result.status !== "already-imported");
-      if (!pending.length) return resultFor(plans, p.db, inspection.migration!, false, null);
-      const savedBackup = yield* Effect.promise(() => verifiedBackup(p.db));
+  validateConversations(conversations);
+  const p = paths(options.t3Home);
+  const plans = await Effect.runPromise(
+    planAll(conversations, options).pipe(Effect.provide(runtimeLayer(p.db, true))),
+  );
+  const pending = plans.filter((plan) => plan.result.status !== "already-imported");
+  if (options.dryRun || !pending.length)
+    return resultFor(plans, p.db, migration, options.dryRun, null);
+  const savedBackup = await getBackup();
+  return Effect.runPromise(
+    Effect.gen(function* () {
       let committed = false;
       yield* Effect.acquireRelease(
         Effect.sync(() => stageAssets(pending, p.assets)),
@@ -1919,7 +1975,7 @@ export async function importNativeConversations(
         ),
       );
       committed = true;
-      return resultFor(plans, p.db, inspection.migration!, false, savedBackup);
+      return resultFor(plans, p.db, migration, false, savedBackup);
     }).pipe(Effect.scoped),
   );
 }

@@ -11,13 +11,17 @@ import {
   inspectNativeTarget,
   readNativeImportMetadata,
   listNativeProjects,
+  NativeImportPlanError,
+  withNativeImportRun,
 } from "./target.js";
 import type {
   NativeConversation,
+  NativeImportResult,
   NativeReadOptions,
   NativeSource,
   NativeSourceReader,
   NativeSourceSummary,
+  NativeWriteResult,
 } from "../src/native/types.js";
 
 function collect(value: string, values: string[]): string[] {
@@ -91,6 +95,91 @@ function sourceOptions(command: Command): Command {
 
 function summaryDetails(summary: NativeSourceSummary) {
   return { ...summary };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+interface BulkImportReport {
+  results: NativeWriteResult[];
+  failures: Array<{ source: NativeSource; sourceId?: string; error: string }>;
+}
+
+async function importSourceFamilies(
+  source: NativeSource,
+  options: NativeReadOptions,
+  importBatch: (conversations: NativeConversation[]) => Promise<NativeImportResult>,
+  report: BulkImportReport,
+) {
+  const history = sourceReader(source);
+  try {
+    let sessions: NativeSourceSummary[];
+    try {
+      sessions = await history.list(options);
+      if (source !== "claude")
+        sessions = sessions.concat(await history.list({ ...options, archived: true }));
+      if (new Set(sessions.map((session) => session.id)).size !== sessions.length)
+        throw new Error(
+          "Native listing contains duplicate session IDs across live history and archives; retry when the source is stable.",
+        );
+    } catch (error) {
+      report.failures.push({ source, error: errorMessage(error) });
+      return;
+    }
+
+    const covered = new Set<string>();
+    const children = new Map<string, string>();
+    for (const session of sessions) {
+      if (session.parentSessionId) children.set(session.id, session.parentSessionId);
+    }
+    for (const session of sessions) {
+      if (children.has(session.id) || covered.has(session.id)) continue;
+      let conversation: NativeConversation;
+      try {
+        conversation = await history.read(
+          source === "omp" ? (session.path ?? session.id) : session.id,
+          {
+            ...options,
+            ...(session.archived ? { archived: true } : {}),
+          },
+        );
+        if (
+          conversation.id !== session.id ||
+          Boolean(conversation.archived) !== Boolean(session.archived)
+        )
+          throw new Error(
+            "Session identity or archive state changed after listing; retry when the source is stable.",
+          );
+      } catch (error) {
+        report.failures.push({ source, sourceId: session.id, error: errorMessage(error) });
+        continue;
+      }
+      const parent = conversation.parent?.sourceId;
+      if (parent) {
+        children.set(session.id, parent);
+        continue;
+      }
+      try {
+        const batch = await importBatch([conversation]);
+        report.results.push(...batch.results);
+        for (const entry of batch.results) covered.add(entry.sourceId);
+      } catch (error) {
+        if (!(error instanceof NativeImportPlanError)) throw error;
+        report.failures.push({ source, sourceId: session.id, error: error.message });
+      }
+    }
+    for (const [sourceId, parent] of children) {
+      if (!covered.has(sourceId))
+        report.failures.push({
+          source,
+          sourceId,
+          error: `Native parent '${parent}' did not supply this child in an importable family.`,
+        });
+    }
+  } finally {
+    await history.close();
+  }
 }
 
 export async function runNativeCli(args: string[]): Promise<void> {
@@ -322,6 +411,76 @@ export async function runNativeCli(args: string[]): Promise<void> {
       print(result, json);
     });
 
+  program
+    .command("import-all")
+    .description("Import local history across all workspaces with one offline backup")
+    .addOption(
+      new Option("--source <source...>", "limit the import to these native history owners").choices(
+        ["codex", "claude", "omp"],
+      ),
+    )
+    .option("--source-home <path>", "source directory when importing from a single source")
+    .option("--binary <command>", "executable or package locator for a single source")
+    .option("--omp-package <path>", "installed OMP source package directory")
+    .option("--bun-binary <command>", "Bun executable for OMP's native libraries (default: bun)")
+    .option("--t3-home <path>", "T3 home (default: T3CODE_HOME or ~/.t3)")
+    .option("--snapshot", "preserve unfinished Claude history as interrupted")
+    .option("--settled", "put non-archived imports on T3's Settled shelf")
+    .option("--dry-run", "validate and plan without writing target data")
+    .addOption(new Option("--yes", "write history to the stopped T3 target").conflicts("dryRun"))
+    .option("--json", "one JSON result on stdout")
+    .action(async (values: Record<string, unknown>) => {
+      json = Boolean(values.json);
+      const sources = [
+        ...new Set<NativeSource>(
+          (values.source as NativeSource[] | undefined) ?? ["codex", "claude", "omp"],
+        ),
+      ];
+      if (sources.length !== 1 && (values.sourceHome || values.binary))
+        throw new CliUsageError("Use --source-home or --binary with exactly one source.");
+      if (!values.dryRun && !values.yes)
+        throw new CliUsageError("Use --dry-run to review the import, or --yes to write it.");
+      const t3Home = targetHome(values);
+      const dryRun = Boolean(values.dryRun);
+      const result = await withNativeImportRun(
+        { t3Home, dryRun, resume: false, settled: values.settled === true },
+        async (target) => {
+          const report: BulkImportReport = { results: [], failures: [] };
+          let fatal: { error: string } | undefined;
+          try {
+            for (const source of sources) {
+              if (!json) console.error(`Checking ${source} history…`);
+              const options = readOptions({
+                ...values,
+                snapshot: source === "claude" && values.snapshot,
+              });
+              await importSourceFamilies(source, options, target.importBatch, report);
+            }
+          } catch (error) {
+            fatal = { error: errorMessage(error) };
+          }
+          return {
+            schemaVersion: 1,
+            status: fatal
+              ? "error"
+              : report.failures.length
+                ? "partial"
+                : dryRun
+                  ? "dry-run"
+                  : "complete",
+            dryRun,
+            target: target.path,
+            migration: target.migration,
+            backup: target.backup,
+            ...report,
+            ...fatal,
+          };
+        },
+      );
+      print(result, json);
+      if (result.status === "partial" || result.status === "error") process.exitCode = 6;
+    });
+
   try {
     if (args.length === 0) {
       program.outputHelp();
@@ -331,7 +490,7 @@ export async function runNativeCli(args: string[]): Promise<void> {
   } catch (error) {
     const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
     if (code === "commander.helpDisplayed" || code === "commander.version") return;
-    const message = error instanceof Error ? error.message : String(error);
+    const message = errorMessage(error);
     if (json) print({ schemaVersion: 1, status: "error", error: message }, true);
     else console.error(message);
     const explicit =

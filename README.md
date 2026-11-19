@@ -9,7 +9,7 @@ Import rich Codex, Oh My Pi and Claude Code history into current T3 Code using t
 - Claude Agent SDK reads selected session histories and native child-agent transcripts.
 - T3's pinned `EventSink` and repositories write events, projections and native resume bindings.
 
-There is no independent rollout parser or copy of T3's projection SQL. This version replaces the old importer; it supports **T3 migrations 96–98**, not the earlier 40–53 schemas. The CLI provides `list`, `show`, `projects`, `doctor` and `import`. It does not include the old TUI, parsers, `sync` or `replace` commands.
+There is no independent rollout parser or copy of T3's projection SQL. This version replaces the old importer; it supports **T3 migrations 96–98**, not the earlier 40–53 schemas. The CLI provides `list`, `show`, `projects`, `doctor`, `import` and `import-all`. It does not include the old TUI, parsers, `sync` or `replace` commands.
 
 ## Build
 
@@ -165,6 +165,20 @@ Remote images are retained as references and are not downloaded. Source blobs th
 Historical file links use their original directories. A deleted file or moved project can therefore fail to open even when the history was imported correctly. The importer does not silently redirect these paths. Optional `--restore-workspace --no-resume` materializes captured Claude text files inside the isolated T3 home's `userdata/recorded-workspaces`, with provenance and a `completeProject: false` manifest in the separate `userdata/recorded-workspace-manifests` directory. Only complete recorded writes/reads and safe edits of a known snapshot are eligible; this is a partial historical workspace, not a restored checkout. The original directory is never created or modified. This option is disabled by default.
 
 `--json` prints one JSON result on stdout. `show --full` includes the normalized conversation content, so use it only when that output is wanted. The built artifact includes the pinned T3 reference and its MIT notice.
+
+## Bulk offline import
+
+`import-all` discovers all workspaces exposed by the local Codex, Claude Code and OMP history APIs, including Codex and OMP archives. It imports history without continuation bindings and keeps each family of linked threads in one transaction. Use `--source codex`, `--source claude` or `--source omp` to limit the run.
+
+```sh
+node dist/cli.js import-all --dry-run --snapshot
+# Quit T3 Code and stop any separate server before applying.
+node dist/cli.js import-all --yes --snapshot
+```
+
+`--snapshot` preserves unfinished Claude tails as interrupted history. `--dry-run` can run alongside T3. It reads and validates the selected history without writing. `--yes` checks that T3 is stopped, acquires its ownership lock and checks the database schema and integrity before opening any source reader. It holds the lock until the run ends. The first batch that writes creates one verified SQLite backup for the run. Dry runs and runs with nothing new to write create no backup.
+
+Source errors and rejected families are listed under `failures` and produce a nonzero exit status. Independent families can still import. Unexpected target errors stop the run and report the backup path if one was created. After resolving the reported problem, rerun the same command. A committed, unchanged family reports `already-imported`. Conflicts leave existing history intact. The SQLite backup covers the database. For a full rollback that also restores settings and attachments, make a separate copy of `userdata` with T3 stopped before applying.
 
 ## Automatic import audit
 

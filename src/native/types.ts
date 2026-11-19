@@ -65,6 +65,8 @@ export interface NativeSourceSummary {
   updatedAt: string;
   /** Source archive status; undefined when the native surface cannot establish it. */
   archived?: boolean;
+  /** Native parent of a listed child session, when the history API reports one. */
+  parentSessionId?: string;
   model?: string;
   path?: string;
 }

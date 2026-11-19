@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 import { initializeNativeTarget } from "./target.ts";
@@ -13,7 +13,7 @@ function cli(...args: string[]) {
     [resolve(process.env.T3_IMPORTER_TEST_CLI || "dist/cli.js"), ...args],
     {
       encoding: "utf8",
-      timeout: 15_000,
+      timeout: 30_000,
       env: { ...process.env, NO_COLOR: "1" },
     },
   );
@@ -88,6 +88,193 @@ test("CLI doctor reports the native target as one JSON result", async () => {
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test(
+  "bulk import refuses a running T3 or corrupt target before contacting native history",
+  { skip: !existsSync(process.env.T3_TEST_SERVER_BINARY ?? join(homedir(), ".t3/bin/t3")) },
+  async () => {
+    const home = mkdtempSync(join(tmpdir(), "t3-import-bulk-preflight-"));
+    const flags = [
+      "import-all",
+      "--source",
+      "codex",
+      "--binary",
+      "never-start-this-source",
+      "--t3-home",
+      home,
+      "--yes",
+      "--json",
+    ];
+    try {
+      await initializeNativeTarget(home, 96);
+      const server = await startIsolatedT3Server({ t3Home: home });
+      try {
+        const result = cli(...flags);
+        assert.notEqual(result.status, 0);
+        assert.match(JSON.parse(result.stdout).error, /T3 is running/);
+      } finally {
+        await server.stop();
+      }
+      writeFileSync(join(home, "userdata", "statev2.sqlite"), "invalid SQLite");
+      const result = cli(...flags);
+      assert.notEqual(result.status, 0);
+      assert.match(JSON.parse(result.stdout).error, /not a database|integrity/i);
+      assert.equal(existsSync(join(home, "userdata", "t3-import-backups")), false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "bulk import plans and writes native families across workspaces with one backup",
+  {
+    timeout: 90_000,
+    skip:
+      process.platform === "win32" ||
+      !existsSync(process.env.T3_TEST_SERVER_BINARY ?? join(homedir(), ".t3/bin/t3")),
+  },
+  async () => {
+    const home = mkdtempSync(join(tmpdir(), "t3-import-bulk-families-"));
+    const source = join(home, "source");
+    const target = join(home, "target");
+    const backups = join(target, "userdata", "t3-import-backups");
+    const flags = [
+      "import-all",
+      "--source",
+      "codex",
+      "--source-home",
+      source,
+      "--binary",
+      resolve("native/cli-family-peer.mjs"),
+      "--t3-home",
+      target,
+      "--json",
+    ];
+    try {
+      mkdirSync(join(source, "workspace"), { recursive: true });
+      writeFileSync(join(source, "bulk"), "");
+      await initializeNativeTarget(target, 96);
+      const preview = cli(...flags, "--dry-run");
+      assert.equal(preview.status, 0, preview.stdout + preview.stderr);
+      assert.equal(JSON.parse(preview.stdout).results.length, 3);
+      assert.equal(existsSync(backups), false);
+
+      const result = cli(...flags, "--yes");
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+      const output = JSON.parse(result.stdout);
+      assert.deepEqual(readdirSync(backups), [basename(output.backup)]);
+      const threads = new Map<string, string>(
+        output.results.map((entry: { sourceId: string; threadId: string }) => [
+          entry.sourceId,
+          entry.threadId,
+        ]),
+      );
+      assert.deepEqual([...threads.keys()].sort(), [
+        "archived-root",
+        "family-child",
+        "family-root",
+      ]);
+
+      const server = await startIsolatedT3Server({ t3Home: target });
+      try {
+        type Snapshot = {
+          projection: {
+            thread: {
+              projectId: string;
+              archivedAt: string | null;
+              lineage: { parentThreadId: string | null };
+            };
+          };
+        };
+        const snapshots = await Promise.all(
+          ["family-root", "family-child", "archived-root"].map((id) =>
+            server.request<Snapshot>(
+              `/api/orchestration/threads/${encodeURIComponent(threads.get(id)!)}`,
+            ),
+          ),
+        );
+        const [root, child, archived] = snapshots.map((snapshot) => snapshot.projection.thread);
+        assert.equal(child!.lineage.parentThreadId, threads.get("family-root"));
+        assert.ok(archived!.archivedAt);
+        assert.notEqual(root!.projectId, archived!.projectId);
+      } finally {
+        await server.stop();
+      }
+
+      const repeat = cli(...flags, "--yes");
+      assert.equal(repeat.status, 0, repeat.stdout + repeat.stderr);
+      assert.equal(JSON.parse(repeat.stdout).backup, null);
+      assert.deepEqual(
+        JSON.parse(repeat.stdout).results.map((entry: { status: string }) => entry.status),
+        Array.from({ length: 3 }, () => "already-imported"),
+      );
+      assert.equal(readdirSync(backups).length, 1);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "bulk import reports an active family and retries it without duplicating other history",
+  { skip: process.platform === "win32" ? "Executable fixture uses a Unix shebang" : false },
+  async () => {
+    const home = mkdtempSync(join(tmpdir(), "t3-import-bulk-retry-"));
+    const source = join(home, "source");
+    const target = join(home, "target");
+    const flags = [
+      "import-all",
+      "--source",
+      "codex",
+      "--source-home",
+      source,
+      "--binary",
+      resolve("native/cli-family-peer.mjs"),
+      "--t3-home",
+      target,
+      "--json",
+      "--yes",
+    ];
+    try {
+      mkdirSync(join(source, "workspace"), { recursive: true });
+      writeFileSync(join(source, "bulk"), "");
+      writeFileSync(join(source, "active-root"), "");
+      await initializeNativeTarget(target, 96);
+      const first = cli(...flags);
+      assert.notEqual(first.status, 0);
+      const partial = JSON.parse(first.stdout);
+      assert.equal(partial.status, "partial");
+      assert.ok(existsSync(partial.backup));
+      assert.deepEqual(
+        partial.results.map((entry: { sourceId: string }) => entry.sourceId),
+        ["archived-root"],
+      );
+      assert.match(
+        partial.failures.find((entry: { sourceId: string }) => entry.sourceId === "family-root")
+          .error,
+        /active or indeterminate/,
+      );
+
+      rmSync(join(source, "active-root"));
+      const repeated = cli(...flags);
+      assert.equal(repeated.status, 0, repeated.stdout + repeated.stderr);
+      assert.deepEqual(
+        JSON.parse(repeated.stdout).results.map((entry: { sourceId: string; status: string }) => [
+          entry.sourceId,
+          entry.status,
+        ]),
+        [
+          ["family-root", "imported"],
+          ["family-child", "imported"],
+          ["archived-root", "already-imported"],
+        ],
+      );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+);
 
 test(
   "CLI preserves native Codex archives and honors opt-in settlement in a real T3 server",

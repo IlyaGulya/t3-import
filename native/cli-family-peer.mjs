@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 const at = 1767225600;
 const childWorkspaceFile = join(process.env.CODEX_HOME, "child-workspace");
+const bulk = existsSync(join(process.env.CODEX_HOME, "bulk"));
 const thread = (id) => ({
   id,
   sessionId: id,
@@ -14,7 +15,9 @@ const thread = (id) => ({
   cwd:
     id === "family-child" && existsSync(childWorkspaceFile)
       ? readFileSync(childWorkspaceFile, "utf8")
-      : process.cwd(),
+      : bulk
+        ? join(process.env.CODEX_HOME, id === "archived-root" ? "deleted-workspace" : "workspace")
+        : process.cwd(),
   createdAt: at,
   updatedAt: at + 20,
   cliVersion: "test",
@@ -28,7 +31,10 @@ const thread = (id) => ({
   ephemeral: false,
   projectId: null,
   historyMode: "paginated",
-  status: { type: "idle" },
+  status:
+    id === "family-root" && existsSync(join(process.env.CODEX_HOME, "active-root"))
+      ? { type: "active", activeFlags: [] }
+      : { type: "idle" },
   turns: [],
 });
 const items = (id) => [
@@ -72,7 +78,14 @@ for await (const line of createInterface({ input: process.stdin, crlfDelay: Infi
       };
       break;
     case "thread/list":
-      result = { data: [thread("family-root"), thread("family-child")], nextCursor: null };
+      result = {
+        data: bulk
+          ? request.params.archived
+            ? [thread("archived-root")]
+            : [thread("family-child"), thread("family-root")]
+          : [thread("family-root"), thread("family-child")],
+        nextCursor: null,
+      };
       break;
     case "thread/read":
       result = { thread: { ...thread(id), turns: request.params.includeTurns ? [turn(id)] : [] } };

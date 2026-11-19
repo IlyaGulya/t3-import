@@ -236,6 +236,12 @@ function summary(thread: Thread | CodexSchema.V2ThreadListResponse__Thread): Nat
   };
 }
 
+function nativeParentId(thread: Thread | CodexSchema.V2ThreadListResponse__Thread) {
+  const subagent = record(record(thread.source)?.subAgent);
+  const parent = record(subagent?.thread_spawn)?.parent_thread_id;
+  return thread.parentThreadId ?? (typeof parent === "string" ? parent : undefined);
+}
+
 function terminalStatus(
   status: string | undefined,
   fallback: NativeTerminalStatus = "completed",
@@ -876,10 +882,7 @@ export function createCodexReader(dependencies: ReaderDependencies = {}): Native
       const childThread = (
         await rpc.request("thread/read", { threadId: childId, includeTurns: false })
       ).thread;
-      const source = record(childThread.source);
-      const nativeParent =
-        childThread.parentThreadId ??
-        record(record(source?.subAgent)?.thread_spawn)?.parent_thread_id;
+      const nativeParent = nativeParentId(childThread);
       if (nativeParent && nativeParent !== id) continue; // A wait may mention a descendant or a peer owned by another native parent.
       if (!nativeParent && !reference.spawned) {
         warnings.add(
@@ -973,7 +976,12 @@ export function createCodexReader(dependencies: ReaderDependencies = {}): Native
       for (const thread of page.data) {
         if (ids.has(thread.id)) continue;
         ids.add(thread.id);
-        const candidate = { ...summary(thread), archived };
+        const parentSessionId = nativeParentId(thread);
+        const candidate = {
+          ...summary(thread),
+          archived,
+          ...(parentSessionId ? { parentSessionId } : {}),
+        };
         if (options.workspace && !sameWorkspace(candidate.workspace, options.workspace)) continue;
         if (since !== undefined && Date.parse(candidate.updatedAt) < since) continue;
         archiveStatus.set(candidate.id, archived);
