@@ -169,6 +169,143 @@ test("Claude history is readable through the CLI using its native selected conve
   }
 });
 
+test("Claude local-command-only history keeps metadata without creating a T3 run", async () => {
+  const f = fixture();
+  const target = mkdtempSync(join(tmpdir(), "t3-claude-metadata-only-"));
+  try {
+    f.write([
+      f.record("command", null, "user", {
+        role: "user",
+        content: "<command-name>/usage</command-name><command-args></command-args>",
+      }),
+      f.record("output", "command", "user", {
+        role: "user",
+        content: "<local-command-stdout>Status dialog dismissed</local-command-stdout>",
+      }),
+    ]);
+    await initializeNativeTarget(target, 96);
+    const result = cli(
+      "import",
+      "--source",
+      "claude",
+      "--source-home",
+      f.home,
+      "--workspace",
+      f.workspace,
+      "--thread",
+      sessionId,
+      "--t3-home",
+      target,
+      "--no-resume",
+      "--yes",
+      "--json",
+    );
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    const thread = JSON.parse(result.stdout).results[0];
+    assert.equal(thread.historyMetadataOnly, "no-visible-turns");
+    const metadata = cli("metadata", "--t3-home", target, "--thread", thread.threadId, "--json");
+    assert.equal(metadata.status, 0, metadata.stdout + metadata.stderr);
+    assert.ok(
+      JSON.parse(metadata.stdout).records.some(
+        (row: { type: string }) => row.type === "local_command_record",
+      ),
+    );
+    const server = await startIsolatedT3Server({ t3Home: target });
+    try {
+      const { projection } = await server.request<{
+        projection: { runs: unknown[]; messages: unknown[] };
+      }>(`/api/orchestration/threads/${encodeURIComponent(thread.threadId)}`);
+      assert.deepEqual(projection.runs, []);
+      assert.deepEqual(projection.messages, []);
+    } finally {
+      await server.stop();
+    }
+  } finally {
+    rmSync(f.home, { recursive: true, force: true });
+    rmSync(target, { recursive: true, force: true });
+  }
+});
+
+test("Claude preserves child transcripts with cyclic native parent metadata", async () => {
+  const f = fixture();
+  const target = mkdtempSync(join(tmpdir(), "t3-claude-cyclic-agents-"));
+  try {
+    const subagents = join(f.directory, sessionId, "subagents");
+    mkdirSync(subagents, { recursive: true });
+    for (const [id, parent] of [
+      ["a1111111111111111", "a2222222222222222"],
+      ["a2222222222222222", "a1111111111111111"],
+    ] as const) {
+      const entries = [
+        f.record("u", null, "user", { role: "user", content: "Child question" }),
+        f.record("a", "u", "assistant", {
+          role: "assistant",
+          stop_reason: "end_turn",
+          content: [{ type: "text", text: "Child answer" }],
+        }),
+      ];
+      writeFileSync(
+        join(subagents, `agent-${id}.jsonl`),
+        entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n",
+      );
+      writeFileSync(
+        join(subagents, `agent-${id}.meta.json`),
+        JSON.stringify({ parentAgentId: parent }),
+      );
+    }
+    await initializeNativeTarget(target, 96);
+    const result = cli(
+      "import",
+      "--source",
+      "claude",
+      "--source-home",
+      f.home,
+      "--workspace",
+      f.workspace,
+      "--thread",
+      sessionId,
+      "--t3-home",
+      target,
+      "--no-resume",
+      "--yes",
+      "--json",
+    );
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    const [root, ...children] = JSON.parse(result.stdout).results;
+    assert.equal(children.length, 2);
+    const server = await startIsolatedT3Server({ t3Home: target });
+    try {
+      for (const [index, child] of children.entries()) {
+        const { projection } = await server.request<{
+          projection: {
+            thread: { lineage: { parentThreadId: string } };
+            messages: { text: string }[];
+          };
+        }>(`/api/orchestration/threads/${encodeURIComponent(child.threadId)}`);
+        assert.equal(projection.thread.lineage.parentThreadId, root.threadId);
+        assert.deepEqual(
+          projection.messages.map((message) => message.text),
+          ["Child question", "Child answer"],
+        );
+        const metadata = cli("metadata", "--t3-home", target, "--thread", child.threadId, "--json");
+        assert.equal(metadata.status, 0, metadata.stdout + metadata.stderr);
+        assert.ok(
+          JSON.parse(metadata.stdout).records.some(
+            (entry: { type: string; nativeParent?: { sourceId: string } }) =>
+              entry.type === "claude_unresolved_parent" &&
+              entry.nativeParent?.sourceId === children[1 - index].sourceId,
+          ),
+        );
+      }
+    } finally {
+      await server.stop();
+    }
+  } finally {
+    rmSync(f.home, { recursive: true, force: true });
+    rmSync(target, { recursive: true, force: true });
+  }
+});
+
 test("Claude full CLI output preserves long Unicode messages across a native child family", () => {
   const f = fixture();
   const text = "Привет 🌍 — записанная история\n".repeat(24_000);
@@ -2174,8 +2311,8 @@ test(
       assert.equal(p.thread.archivedAt, null);
       assert.equal(
         p.thread.settledOverride,
-        "active",
-        "ordinary imports belong in the project list",
+        "settled",
+        "inactive family roots belong on the Settled shelf",
       );
       assert.equal(p.runs.length, 1);
       assert.equal(p.runs[0]!.startedAt, at(10));

@@ -87,6 +87,10 @@ export interface NativeConversation extends NativeSourceSummary {
   parent?: { sourceId: string; nativeItemId?: string; relationship?: "subagent" | "fork" };
   /** Selected native metadata retained outside visible chat (opaque SDK records). */
   nativeMetadata?: JsonValue[];
+  /** The native source supplied stable metadata but no transcript turns. */
+  historyMetadataOnly?: "missing-native-transcript" | "no-visible-turns";
+  /** Native child IDs whose unavailable transcripts are represented by metadata on this thread. */
+  retainedChildMetadata?: string[];
   sourceCoverage?: NativeSourceCoverage;
   turns: NativeHistoryTurn[];
   warnings: string[];
@@ -122,6 +126,8 @@ export interface NativeReadOptions {
   binary?: string;
   ompPackage?: string;
   bunBinary?: string;
+  /** Codex inventory from its state index, without an app-server rollout scan. */
+  codexIndexOnly?: boolean;
   /** Deliberate Claude history-only snapshot; incomplete tails remain interrupted. */
   snapshot?: boolean;
 }
@@ -146,6 +152,9 @@ export interface NativeWriteOptions {
   resume: boolean;
   /** Put newly imported, non-archived roots on T3's Settled shelf. */
   settled?: boolean;
+  oldFamilyDays?: number;
+  oldFamilyAction?: "keep" | "settle" | "archive";
+  archiveEmptyChildren?: boolean;
   /** Destination grouping only; each native session keeps its original cwd. */
   projectRoot?: string;
   projectId?: string;
@@ -163,6 +172,9 @@ export interface NativeWriteResult {
   items: number;
   messages: number;
   resumable: boolean;
+  placement: NativeThreadPlacement;
+  historyMetadataOnly?: NativeConversation["historyMetadataOnly"];
+  retainedChildMetadata?: string[];
   quality?: {
     targetSchema: "validated";
     serverVerification: "not-run";
@@ -172,12 +184,28 @@ export interface NativeWriteResult {
   warnings: string[];
 }
 
+export interface NativeThreadPlacement {
+  state: "active" | "settled" | "archived";
+  reason:
+    | "recent-family"
+    | "inactive-family"
+    | "inactive-family-kept"
+    | "historical-child"
+    | "empty-subagent"
+    | "source-archive"
+    | "metadata-only"
+    | "requested-settle"
+    | "already-imported";
+  familyLastActivityAt?: string;
+}
+
 export interface NativeImportResult {
   schemaVersion: 1;
   status: "dry-run" | "imported" | "already-imported" | "mixed";
   target: string;
   migration: number;
   backup: string | null;
+  placementCounts: Record<NativeThreadPlacement["state"], number>;
   results: NativeWriteResult[];
 }
 

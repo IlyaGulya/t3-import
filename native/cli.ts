@@ -1,4 +1,5 @@
 import { Command, Option } from "commander";
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { homedir } from "node:os";
 import { createCodexReader } from "./codex.js";
@@ -8,6 +9,13 @@ import { createClaudeReader } from "./claude.js";
 import { writeNativeJson } from "./json-output.js";
 import { HistorySpool } from "./history-spool.js";
 import {
+  readRetryFile,
+  saveRetryFile,
+  type RetryManifest,
+  type RetrySource,
+} from "./retry-file.js";
+import {
+  countNativePlacement,
   importNativeConversations,
   inspectNativeTarget,
   withNativeImportMetadata,
@@ -22,6 +30,7 @@ import type {
   NativeSource,
   NativeSourceReader,
   NativeSourceSummary,
+  NativeWriteOptions,
   NativeWriteResult,
 } from "../src/native/types.js";
 
@@ -94,6 +103,46 @@ function sourceOptions(command: Command): Command {
     .option("--json", "one JSON result on stdout");
 }
 
+function placementOptions(command: Command): Command {
+  return command
+    .option("--settled", "put non-archived import roots on T3's Settled shelf")
+    .option(
+      "--old-family-days <days>",
+      "days without family activity before placement (default: 30)",
+      (value: string) => {
+        const days = Number(value);
+        if (!/^\d+$/u.test(value) || !Number.isSafeInteger(days) || days < 1)
+          throw new CliUsageError("--old-family-days must be a positive integer.");
+        return days;
+      },
+    )
+    .addOption(
+      new Option(
+        "--old-family-action <action>",
+        "placement for inactive families (default: settle)",
+      ).choices(["keep", "settle", "archive"]),
+    )
+    .option("--no-archive-empty-children", "keep confirmed empty subagents on the Settled shelf");
+}
+
+function readPlacementOptions(
+  values: Record<string, unknown>,
+): Pick<
+  NativeWriteOptions,
+  "settled" | "oldFamilyDays" | "oldFamilyAction" | "archiveEmptyChildren"
+> {
+  return {
+    settled: values.settled === true,
+    ...(typeof values.oldFamilyDays === "number" ? { oldFamilyDays: values.oldFamilyDays } : {}),
+    ...(values.oldFamilyAction === "keep" ||
+    values.oldFamilyAction === "settle" ||
+    values.oldFamilyAction === "archive"
+      ? { oldFamilyAction: values.oldFamilyAction }
+      : {}),
+    archiveEmptyChildren: values.archiveEmptyChildren !== false,
+  };
+}
+
 function summaryDetails(summary: NativeSourceSummary) {
   return { ...summary };
 }
@@ -128,11 +177,24 @@ interface BulkImportReport {
   failures: Array<{ source: NativeSource; sourceId?: string; error: string }>;
 }
 
+function familyRoot(id: string, parents: ReadonlyMap<string, string>): string {
+  const seen = new Set<string>();
+  let current = id;
+  let parent = parents.get(current);
+  while (parent !== undefined && !seen.has(parent)) {
+    seen.add(current);
+    current = parent;
+    parent = parents.get(current);
+  }
+  return current;
+}
+
 async function importSourceFamilies(
   source: NativeSource,
   options: NativeReadOptions,
   importBatch: (conversations: NativeConversationView[]) => Promise<NativeImportResult>,
   report: BulkImportReport,
+  sessionIds?: readonly string[],
 ) {
   const history = sourceReader(source);
   try {
@@ -152,10 +214,24 @@ async function importSourceFamilies(
 
     const covered = new Set<string>();
     const children = new Map<string, string>();
+    const inventory = new Map(sessions.map((session) => [session.id, session]));
     for (const session of sessions) {
       if (session.parentSessionId) children.set(session.id, session.parentSessionId);
     }
-    for (const session of sessions) {
+    const selectedRoots =
+      sessionIds === undefined
+        ? undefined
+        : new Set(sessionIds.map((id) => familyRoot(id, children)));
+    const queue = selectedRoots
+      ? sessions.filter((session) => selectedRoots.has(session.id))
+      : sessions;
+    const failed = new Set<string>();
+    const reportFailure = (sourceId: string, error: unknown) => {
+      if (failed.has(sourceId)) return;
+      failed.add(sourceId);
+      report.failures.push({ source, sourceId, error: errorMessage(error) });
+    };
+    for (const session of queue) {
       if (children.has(session.id) || covered.has(session.id)) continue;
       let snapshot: NativeHistorySnapshot | undefined;
       try {
@@ -176,7 +252,7 @@ async function importSourceFamilies(
           );
       } catch (error) {
         snapshot?.close();
-        report.failures.push({ source, sourceId: session.id, error: errorMessage(error) });
+        reportFailure(session.id, error);
         continue;
       }
       const { conversation } = snapshot;
@@ -184,29 +260,57 @@ async function importSourceFamilies(
         const parent = conversation.parent?.sourceId;
         if (parent) {
           children.set(session.id, parent);
+          if (selectedRoots) {
+            const root = familyRoot(parent, children);
+            const next = inventory.get(root);
+            if (next && !selectedRoots.has(root)) queue.push(next);
+            selectedRoots.add(root);
+          }
           continue;
         }
         const batch = await importBatch([conversation]);
         report.results.push(...batch.results);
-        for (const entry of batch.results) covered.add(entry.sourceId);
+        for (const entry of batch.results) {
+          covered.add(entry.sourceId);
+          for (const childId of entry.retainedChildMetadata ?? []) covered.add(childId);
+        }
       } catch (error) {
         if (!(error instanceof NativeImportPlanError)) throw error;
-        report.failures.push({ source, sourceId: session.id, error: error.message });
+        reportFailure(session.id, error);
       } finally {
         snapshot.close();
       }
     }
     for (const [sourceId, parent] of children) {
-      if (!covered.has(sourceId))
-        report.failures.push({
-          source,
+      if (
+        !covered.has(sourceId) &&
+        (!selectedRoots || selectedRoots.has(familyRoot(sourceId, children)))
+      )
+        reportFailure(
           sourceId,
-          error: `Native parent '${parent}' did not supply this child in an importable family.`,
-        });
+          `Native parent '${parent}' did not supply this child in an importable family.`,
+        );
     }
+    for (const sourceId of sessionIds ?? [])
+      if (!covered.has(sourceId))
+        reportFailure(sourceId, "The selected session was not found in native history.");
   } finally {
     await history.close();
   }
+}
+
+function bulkSourceOptions(
+  source: NativeSource,
+  values: Record<string, unknown>,
+): RetrySource["options"] {
+  const options = readOptions({ ...values, snapshot: source !== "codex" && values.snapshot });
+  // Paths to custom reader executables must keep working from another directory.
+  for (const key of ["binary", "bunBinary"] as const) {
+    const command = options[key];
+    if (command && /[/\\]/u.test(command)) options[key] = absolutePath(command);
+  }
+  if (source === "codex" && values.codexIndexOnly) options.codexIndexOnly = true;
+  return options;
 }
 
 export async function runNativeCli(args: string[]): Promise<void> {
@@ -262,6 +366,12 @@ export async function runNativeCli(args: string[]): Promise<void> {
             active: conversation.active,
             ...(conversation.archived === undefined ? {} : { archived: conversation.archived }),
             turns: conversation.turns.length,
+            ...(conversation.historyMetadataOnly
+              ? { historyMetadataOnly: conversation.historyMetadataOnly }
+              : {}),
+            ...(conversation.retainedChildMetadata
+              ? { retainedChildMetadata: conversation.retainedChildMetadata }
+              : {}),
             items,
             itemKinds,
             ...(conversation.sourceCoverage ? { sourceCoverage: conversation.sourceCoverage } : {}),
@@ -345,7 +455,11 @@ export async function runNativeCli(args: string[]): Promise<void> {
       );
     });
 
-  sourceOptions(program.command("import").description("Import rich native history into current T3"))
+  placementOptions(
+    sourceOptions(
+      program.command("import").description("Import rich native history into current T3"),
+    ),
+  )
     .option("--thread <id>", "native source session ID (repeatable)", collect, [])
     .option("--all", "import all source sessions matching --workspace")
     .option("--t3-home <path>", "T3 home (default: T3CODE_HOME or ~/.t3)")
@@ -363,7 +477,6 @@ export async function runNativeCli(args: string[]): Promise<void> {
       ).conflicts("projectRoot"),
     )
     .option("--no-resume", "import history without binding a native session for continuation")
-    .option("--settled", "put non-archived imports on T3's Settled shelf")
     .option(
       "--restore-workspace",
       "restore recorded text files into an isolated workspace; requires --no-resume",
@@ -422,7 +535,7 @@ export async function runNativeCli(args: string[]): Promise<void> {
         t3Home: targetHome(values),
         dryRun: Boolean(values.dryRun),
         resume: values.resume !== false,
-        settled: values.settled === true,
+        ...readPlacementOptions(values),
         ...(values.restoreWorkspace === true ? { restoreWorkspace: true } : {}),
         ...(typeof values.providerInstance === "string"
           ? { providerInstance: values.providerInstance }
@@ -435,9 +548,11 @@ export async function runNativeCli(args: string[]): Promise<void> {
       print(result, json);
     });
 
-  program
-    .command("import-all")
-    .description("Import local history across all workspaces with one offline backup")
+  placementOptions(
+    program
+      .command("import-all")
+      .description("Import local history across all workspaces with one offline backup"),
+  )
     .addOption(
       new Option("--source <source...>", "limit the import to these native history owners").choices(
         ["codex", "claude", "omp"],
@@ -449,7 +564,24 @@ export async function runNativeCli(args: string[]): Promise<void> {
     .option("--bun-binary <command>", "Bun executable for OMP's native libraries (default: bun)")
     .option("--t3-home <path>", "T3 home (default: T3CODE_HOME or ~/.t3)")
     .option("--snapshot", "preserve unfinished Claude or OMP history as interrupted")
-    .option("--settled", "put non-archived imports on T3's Settled shelf")
+    .option("--codex-index-only", "read Codex inventory from its existing native state index")
+    .option("--retry-file <path>", "save the remaining work in a new JSON file")
+    .addOption(
+      new Option("--retry-from <path>", "retry only the remaining work in a saved file").conflicts([
+        "source",
+        "sourceHome",
+        "binary",
+        "ompPackage",
+        "bunBinary",
+        "t3Home",
+        "snapshot",
+        "codexIndexOnly",
+        "settled",
+        "oldFamilyDays",
+        "oldFamilyAction",
+        "archiveEmptyChildren",
+      ]),
+    )
     .option("--dry-run", "validate and plan without writing target data")
     .addOption(new Option("--yes", "write history to the stopped T3 target").conflicts("dryRun"))
     .option("--json", "one JSON result on stdout")
@@ -462,42 +594,90 @@ export async function runNativeCli(args: string[]): Promise<void> {
       ];
       if (sources.length !== 1 && (values.sourceHome || values.binary))
         throw new CliUsageError("Use --source-home or --binary with exactly one source.");
+      if (values.codexIndexOnly && !sources.includes("codex"))
+        throw new CliUsageError("--codex-index-only requires Codex in the source selection.");
       if (!values.dryRun && !values.yes)
         throw new CliUsageError("Use --dry-run to review the import, or --yes to write it.");
-      const t3Home = targetHome(values);
       const dryRun = Boolean(values.dryRun);
+      const retryPath =
+        typeof values.retryFile === "string" ? absolutePath(values.retryFile) : undefined;
+      if (retryPath && existsSync(retryPath))
+        throw new CliUsageError(`Retry file '${retryPath}' already exists. Choose a new path.`);
+      const retry =
+        typeof values.retryFrom === "string"
+          ? await readRetryFile(absolutePath(values.retryFrom)).catch((error) => {
+              throw new CliUsageError(`Cannot read retry file: ${errorMessage(error)}`);
+            })
+          : undefined;
+      const t3Home = retry?.t3Home ?? targetHome(values);
+      const placement = retry?.placement ?? readPlacementOptions(values);
+      const jobs =
+        retry?.sources ??
+        sources.map((source): RetrySource => ({
+          source,
+          options: bulkSourceOptions(source, values),
+        }));
       const result = await withNativeImportRun(
-        { t3Home, dryRun, resume: false, settled: values.settled === true },
+        { t3Home, dryRun, resume: false, ...placement },
         async (target) => {
           const report: BulkImportReport = { results: [], failures: [] };
+          const remaining = new Map(jobs.map((job) => [job.source, job]));
           let fatal: { error: string } | undefined;
           try {
-            for (const source of sources) {
+            for (const job of jobs) {
+              const { source, options, sessionIds } = job;
               if (!json) console.error(`Checking ${source} history…`);
-              const options = readOptions({
-                ...values,
-                snapshot: source !== "codex" && values.snapshot,
-              });
-              await importSourceFamilies(source, options, target.importBatch, report);
+              const failureStart = report.failures.length;
+              await importSourceFamilies(source, options, target.importBatch, report, sessionIds);
+              const failures = report.failures.slice(failureStart);
+              if (!failures.length) remaining.delete(source);
+              else if (failures.every((entry) => entry.sourceId !== undefined))
+                remaining.set(source, {
+                  ...job,
+                  sessionIds: failures.map((entry) => entry.sourceId!),
+                });
             }
           } catch (error) {
             fatal = { error: errorMessage(error) };
           }
+          let retryFile: string | null = null;
+          let unsavedRetry: { retryFileError: string; retryManifest: RetryManifest } | undefined;
+          if (retryPath || (!dryRun && remaining.size > 0)) {
+            const retryManifest: RetryManifest = {
+              schemaVersion: 1,
+              kind: "t3-import-retry",
+              t3Home,
+              placement,
+              sources: [...remaining.values()],
+            };
+            try {
+              retryFile = await saveRetryFile(retryManifest, target.path, retryPath);
+            } catch (error) {
+              unsavedRetry = { retryFileError: errorMessage(error), retryManifest };
+            }
+          }
           return {
             schemaVersion: 1,
-            status: fatal
-              ? "error"
-              : report.failures.length
-                ? "partial"
-                : dryRun
-                  ? "dry-run"
-                  : "complete",
+            status:
+              fatal || unsavedRetry
+                ? "error"
+                : report.failures.length
+                  ? "partial"
+                  : dryRun
+                    ? "dry-run"
+                    : "complete",
             dryRun,
             target: target.path,
             migration: target.migration,
             backup: target.backup,
+            retryFile,
+            placementCounts: countNativePlacement(report.results),
+            ...(jobs.some(({ options }) => options.codexIndexOnly)
+              ? { codexInventory: "native-state-index" }
+              : {}),
             ...report,
             ...fatal,
+            ...unsavedRetry,
           };
         },
       );

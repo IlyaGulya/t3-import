@@ -74,6 +74,7 @@ import type {
   NativeImportResult,
   NativeWriteOptions,
   NativeWriteResult,
+  NativeThreadPlacement,
   NativeAuditManifest,
   NativeAuditEntry,
   JsonValue,
@@ -389,6 +390,8 @@ interface Plan {
   runRoots: Map<RunCreated["payload"]["id"], RunCreated["payload"]["rootNodeId"]>;
   createdChildScope: boolean;
   lastStatus: NativeTerminalStatus;
+  emptyTranscript: boolean;
+  lastActivityAt: number;
   prompt: () => string;
   answer: () => string | null;
   assets: Asset[];
@@ -761,7 +764,7 @@ function createPlan(
     return event;
   };
   const archived = !conversation.parent && conversation.archived === true;
-  const settled = !archived && options.settled === true;
+  const settled = !archived && (options.settled === true || conversation.historyMetadataOnly);
   if (archived)
     warnings.push(
       "The source confirms archival without a timestamp; T3 uses the last source update time.",
@@ -824,6 +827,8 @@ function createPlan(
   let turnIndex = 0;
   let messages = 0;
   let lastStatus: NativeTerminalStatus = "completed";
+  let lastActivityAt = -Infinity;
+  let allTurnsCompleted = true;
   let prompt: string | undefined;
   let answer: string | null = null;
   const turnIds = new Set<string>();
@@ -834,6 +839,10 @@ function createPlan(
     if (!["completed", "interrupted", "failed"].includes(turn.status))
       throw new NativeImportPlanError(`Source '${sourceKey}' has a non-terminal turn.`);
     lastStatus = turn.status;
+    if (turn.status !== "completed") {
+      allTurnsCompleted = false;
+      lastActivityAt = Math.max(lastActivityAt, Date.parse(turn.completedAt));
+    }
     const runId = allocator.derive.run({ threadId, ordinal: turnIndex + 1 });
     const attemptId = allocator.derive.runAttempt({ runId, attemptOrdinal: 1 });
     const rootNodeId = allocator.derive.rootNode({ runId });
@@ -1013,6 +1022,12 @@ function createPlan(
       };
       if (DateTime.toEpochMillis(base.completedAt) < DateTime.toEpochMillis(base.startedAt))
         throw new Error(`Native item '${item.id}' ends before it starts.`);
+      if (!independent && item.kind !== "compaction")
+        lastActivityAt = Math.max(
+          lastActivityAt,
+          DateTime.toEpochMillis(base.completedAt),
+          DateTime.toEpochMillis(completedAt),
+        );
       const prefix = `item:${turnIndex}:${itemIndex++}`;
       const content = { ...item.data };
       const reserved = [
@@ -1192,6 +1207,11 @@ function createPlan(
   }
   const readPrompt = stageValue(spool, prompt ?? "");
   const readAnswer = stageValue(spool, answer);
+  const emptyTranscript =
+    turnIndex > 0 &&
+    ordinal === 0 &&
+    allTurnsCompleted &&
+    conversation.sourceCoverage?.selectedRecords === 0;
   return {
     conversation,
     sourceKey,
@@ -1213,6 +1233,11 @@ function createPlan(
     runRoots,
     createdChildScope: false,
     lastStatus,
+    emptyTranscript,
+    lastActivityAt:
+      Number.isFinite(lastActivityAt) || (conversation.parent && emptyTranscript)
+        ? lastActivityAt
+        : DateTime.toEpochMillis(updatedAt),
     prompt: readPrompt,
     answer: readAnswer,
     assets,
@@ -1231,6 +1256,13 @@ function createPlan(
       items: ordinal,
       messages,
       resumable: options.resume,
+      placement: initialPlacement(conversation, options),
+      ...(conversation.historyMetadataOnly
+        ? { historyMetadataOnly: conversation.historyMetadataOnly }
+        : {}),
+      ...(conversation.retainedChildMetadata
+        ? { retainedChildMetadata: conversation.retainedChildMetadata }
+        : {}),
       quality: {
         targetSchema: "validated",
         serverVerification: "not-run",
@@ -1378,7 +1410,9 @@ function linkChildPlan(parent: Plan, child: Plan, allocator: IdAllocator.IdAlloc
     child.result.warnings.push(
       "Native child launch is unavailable in the selected parent history; thread lineage is preserved without inventing ownership by a parent run.",
     );
-  const status = child.lastStatus;
+  const status = child.conversation.historyMetadataOnly ? "idle" : child.lastStatus;
+  const lifecycleStartedAt = status === "idle" ? null : startedAt;
+  const lifecycleCompletedAt = status === "idle" ? null : now;
   const prompt = child.prompt();
   const result = child.answer();
   const childThread = makeSubagentChildThread({
@@ -1443,8 +1477,8 @@ function linkChildPlan(parent: Plan, child: Plan, allocator: IdAllocator.IdAlloc
         nativeItemRef: nativeTaskRef,
         runtimeRequestId: null,
         checkpointScopeId: null,
-        startedAt,
-        completedAt: now,
+        startedAt: lifecycleStartedAt,
+        completedAt: lifecycleCompletedAt,
       },
       common,
     ),
@@ -1467,8 +1501,8 @@ function linkChildPlan(parent: Plan, child: Plan, allocator: IdAllocator.IdAlloc
     modelSelection: childThread.modelSelection,
     status,
     result,
-    startedAt,
-    completedAt: now,
+    startedAt: lifecycleStartedAt,
+    completedAt: lifecycleCompletedAt,
     updatedAt: now,
   };
   const link = parent.recordEvent(
@@ -1507,8 +1541,8 @@ function linkChildPlan(parent: Plan, child: Plan, allocator: IdAllocator.IdAlloc
         result,
         status,
         title: child.conversation.title,
-        startedAt,
-        completedAt: now,
+        startedAt: lifecycleStartedAt,
+        completedAt: lifecycleCompletedAt,
         updatedAt: now,
       },
       common,
@@ -1567,9 +1601,66 @@ function readMarker(dbPath: string, sourceKey: string) {
   }
 }
 
+type PlanningOptions = NativeWriteOptions & { placementCutoff: number };
+
+function initialPlacement(
+  conversation: NativeConversationView,
+  options: NativeWriteOptions,
+): NativeThreadPlacement {
+  if (conversation.archived === true) return { state: "archived", reason: "source-archive" };
+  if (conversation.parent) return { state: "settled", reason: "historical-child" };
+  if (options.settled) return { state: "settled", reason: "requested-settle" };
+  if (conversation.historyMetadataOnly) return { state: "settled", reason: "metadata-only" };
+  return { state: "active", reason: "recent-family" };
+}
+
+function applyPlacement(plan: Plan, familyLastActivityAt: number, options: PlanningOptions) {
+  const placement = plan.result.placement;
+  const conversation = plan.conversation;
+  const inactive = familyLastActivityAt < options.placementCutoff;
+  if (!conversation.parent)
+    placement.familyLastActivityAt = new Date(familyLastActivityAt).toISOString();
+  if (inactive && options.oldFamilyAction === "archive" && placement.state !== "archived") {
+    placement.state = "archived";
+    placement.reason = "inactive-family";
+  } else if (inactive && placement.state === "active") {
+    if (options.oldFamilyAction === "keep") placement.reason = "inactive-family-kept";
+    else {
+      placement.state = "settled";
+      placement.reason = "inactive-family";
+    }
+  } else if (
+    options.archiveEmptyChildren !== false &&
+    placement.reason === "historical-child" &&
+    conversation.parent?.relationship !== "fork" &&
+    !plan.childThreadIds?.length &&
+    !conversation.retainedChildMetadata?.length &&
+    plan.emptyTranscript
+  ) {
+    placement.state = "archived";
+    placement.reason = "empty-subagent";
+  }
+  const payload = plan.creation.payload;
+  plan.creation = {
+    ...plan.creation,
+    payload: {
+      ...payload,
+      archivedAt: placement.state === "archived" ? payload.updatedAt : null,
+      settledOverride: placement.state === "archived" ? null : placement.state,
+      settledAt: placement.state === "settled" ? payload.updatedAt : null,
+    },
+  };
+}
+
+export function countNativePlacement(results: NativeWriteResult[]) {
+  const counts = { active: 0, settled: 0, archived: 0 };
+  for (const result of results) counts[result.placement.state]++;
+  return counts;
+}
+
 function planAll(
   conversations: NativeConversationView[],
-  options: NativeWriteOptions,
+  options: PlanningOptions,
   spool?: HistorySpool,
 ) {
   return Effect.gen(function* () {
@@ -1658,6 +1749,14 @@ function planAll(
       linked.add(plan.sourceKey);
     };
     plans.forEach(link);
+    const familyActivity = new Map<ThreadId, number>();
+    for (const plan of plans) {
+      const root = plan.creation.payload.lineage.rootThreadId;
+      familyActivity.set(
+        root,
+        Math.max(familyActivity.get(root) ?? -Infinity, plan.lastActivityAt),
+      );
+    }
     for (const plan of plans) {
       const marker = readMarker(paths(options.t3Home).db, plan.sourceKey);
       // Lineage and parent link records are part of the replay identity too.
@@ -1688,9 +1787,25 @@ function planAll(
             `Imported target '${plan.sourceKey}' contains newer T3 activity; history was not overwritten.`,
           );
         plan.result.status = "already-imported";
+        plan.result.placement = {
+          state:
+            thread.archivedAt !== null
+              ? "archived"
+              : thread.settledOverride === "settled"
+                ? "settled"
+                : "active",
+          reason: "already-imported",
+        };
       } else if (thread) {
         throw new NativeImportPlanError(
           `Target thread '${plan.result.threadId}' already exists without this importer's marker.`,
+        );
+      } else {
+        // Placement is an import-time choice. Keep the historical replay identity stable.
+        applyPlacement(
+          plan,
+          familyActivity.get(plan.creation.payload.lineage.rootThreadId)!,
+          options,
         );
       }
     }
@@ -1722,7 +1837,14 @@ function validateConversations(conversations: NativeConversationView[]) {
       (conversation.source === "claude" && conversation.driver !== "claudeAgent")
     )
       throw new NativeImportPlanError(`Source '${key}' has a mismatched native driver.`);
-    if (!conversation.turns.length)
+    if (conversation.historyMetadataOnly) {
+      if (
+        conversation.turns.length ||
+        !conversation.nativeMetadata?.length ||
+        conversation.resumeSupported !== false
+      )
+        throw new NativeImportPlanError(`Source '${key}' has inconsistent metadata-only history.`);
+    } else if (!conversation.turns.length)
       throw new NativeImportPlanError(`Source '${key}' has no terminal history to import.`);
   }
 }
@@ -1929,6 +2051,7 @@ function resultFor(
     target,
     migration,
     backup,
+    placementCounts: countNativePlacement(plans.map((plan) => plan.result)),
     results: plans.map((plan) => plan.result),
   };
 }
@@ -1943,6 +2066,13 @@ export async function withNativeImportRun<T>(
   }) => Promise<T>,
 ): Promise<T> {
   const p = paths(options.t3Home);
+  const oldFamilyDays = options.oldFamilyDays ?? 30;
+  if (!Number.isSafeInteger(oldFamilyDays) || oldFamilyDays < 1)
+    throw new NativeImportPlanError("The old family threshold must be a positive integer.");
+  const planningOptions = {
+    ...options,
+    placementCutoff: Date.now() - oldFamilyDays * 86_400_000,
+  };
   if (options.initialize && !existsSync(p.db)) {
     if (options.dryRun) throw new Error("Dry-run never initializes a missing target.");
     await initializeNativeTarget(options.t3Home);
@@ -1965,7 +2095,7 @@ export async function withNativeImportRun<T>(
       path: p.db,
       migration,
       importBatch: (conversations) =>
-        writeNativeBatch(conversations, options, migration, () => {
+        writeNativeBatch(conversations, planningOptions, migration, () => {
           return (pendingBackup ??= verifiedBackup(p.db).then((path) => (savedBackup = path)));
         }),
       get backup() {
@@ -1995,7 +2125,7 @@ export async function importNativeConversations(
 
 async function writeNativeBatch(
   conversations: NativeConversationView[],
-  options: NativeWriteOptions,
+  options: PlanningOptions,
   migration: number,
   getBackup: () => Promise<string>,
 ): Promise<NativeImportResult> {
@@ -2046,7 +2176,7 @@ function* eventBatches(plan: Plan, staged: boolean): Generator<DomainEvent[]> {
 
 async function writePlannedBatch(
   conversations: NativeConversationView[],
-  options: NativeWriteOptions,
+  options: PlanningOptions,
   migration: number,
   getBackup: () => Promise<string>,
   spool?: HistorySpool,

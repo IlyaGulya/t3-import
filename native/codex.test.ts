@@ -569,10 +569,10 @@ test(
         [
           "initialize",
           "thread/read",
+          "thread/list",
           "thread/turns/list",
           "thread/items/list",
           "thread/read",
-          "thread/list",
         ],
       );
     } finally {

@@ -1,7 +1,10 @@
 import { basename, extname, isAbsolute, relative, resolve, sep } from "node:path";
 import { FILE_HEADERS_ONLY, formatPatch, parsePatch, structuredPatch } from "diff";
 import { homedir } from "node:os";
-import { realpathSync } from "node:fs";
+import { createReadStream, realpathSync } from "node:fs";
+import { stat } from "node:fs/promises";
+import { pipeline } from "node:stream/promises";
+import { createZstdDecompress } from "node:zlib";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -240,6 +243,90 @@ function nativeParentId(thread: Thread | CodexSchema.V2ThreadListResponse__Threa
   const subagent = record(record(thread.source)?.subAgent);
   const parent = record(subagent?.thread_spawn)?.parent_thread_id;
   return thread.parentThreadId ?? (typeof parent === "string" ? parent : undefined);
+}
+
+async function rolloutRevision(path: string): Promise<string | undefined> {
+  try {
+    const { dev, ino, size, mtimeNs, ctimeNs } = await stat(path, { bigint: true });
+    return [dev, ino, size, mtimeNs, ctimeNs].join(":");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+type EmptyRollout = "absent" | { path: string; revision: string };
+
+async function emptyRollout(path: string | null | undefined): Promise<EmptyRollout | undefined> {
+  if (!path || !isAbsolute(path) || !/\.jsonl(?:\.zst)?$/u.test(path)) return undefined;
+  const compressed = path.endsWith(".zst");
+  if (!compressed && (await rolloutRevision(path)) !== undefined) return undefined;
+  const candidate = compressed ? path : path + ".zst";
+  const revision = await rolloutRevision(candidate);
+  return revision === undefined ? "absent" : { path: candidate, revision };
+}
+
+function sameEmptyRollout(left: EmptyRollout, right: EmptyRollout | undefined): boolean {
+  return typeof left === "string"
+    ? left === right
+    : typeof right === "object" && left.path === right.path && left.revision === right.revision;
+}
+
+/** Confirm that only a header and any inherited prefix are present. Codex decodes all events. */
+async function verifyCompressedRolloutWithoutLocalHistory(
+  path: string,
+  threadId: string,
+): Promise<boolean> {
+  const badBoundary = () =>
+    new Error(
+      `Codex returned no native turns for compressed rollout '${threadId}' with an unverified subagent history boundary.`,
+    );
+  let inherited = false;
+  await pipeline(createReadStream(path), createZstdDecompress(), async (source) => {
+    let boundary: number | undefined;
+    let ordinal = 0;
+    const consumeLine = (line: string) => {
+      if (boundary === undefined) {
+        let header: Record<string, unknown> | undefined;
+        try {
+          header = record(JSON.parse(line));
+        } catch {
+          throw badBoundary();
+        }
+        const meta = record(header?.payload);
+        const start = meta?.subagent_history_start_ordinal ?? 1;
+        if (
+          header?.type !== "session_meta" ||
+          header.ordinal !== 0 ||
+          meta?.id !== threadId ||
+          meta.history_mode !== "paginated" ||
+          typeof start !== "number" ||
+          !Number.isSafeInteger(start) ||
+          start < 1
+        )
+          throw badBoundary();
+        boundary = start;
+      } else {
+        const envelope = /^\{"timestamp":"[^"]+","ordinal":(\d+),/u.exec(line);
+        if (Number(envelope?.[1]) !== ordinal || !line.trimEnd().endsWith("}")) throw badBoundary();
+        if (ordinal >= boundary)
+          throw new Error(
+            `Codex compressed rollout contains local records for '${threadId}', but the native API returned no native turns.`,
+          );
+      }
+      ordinal++;
+    };
+    const text = new TextDecoder();
+    let tail = "";
+    for await (const chunk of source) {
+      const lines = (tail + text.decode(chunk, { stream: true })).split("\n");
+      tail = lines.pop()!;
+      for (const line of lines) consumeLine(line);
+    }
+    if (tail || text.decode() || ordinal !== boundary) throw badBoundary();
+    inherited = ordinal > 1;
+  });
+  return inherited;
 }
 
 function terminalStatus(
@@ -716,6 +803,8 @@ export function createCodexReader(dependencies: ReaderDependencies = {}): Native
   let connection: Promise<CodexHistoryRpc> | undefined;
   let connectionKey: string | undefined;
   let closed = false;
+  const archiveStatus = new Map<string, boolean>();
+  const listedChildren = new Map<string, Set<string>>();
   const connect = async (options: NativeReadOptions) => {
     if (closed) throw new Error("Codex history reader is closed.");
     const key = JSON.stringify([
@@ -736,7 +825,11 @@ export function createCodexReader(dependencies: ReaderDependencies = {}): Native
     seen: Set<string>,
     ancestry: Set<string>,
     knownThread?: Thread,
-  ): Promise<NativeConversation> => {
+  ): Promise<{
+    conversation: NativeConversation;
+    compressedWithoutLocalHistory: boolean;
+    retainedCompressedWithoutLocalHistory: number;
+  }> => {
     const rpc = await connect(options);
     const thread =
       knownThread ??
@@ -750,13 +843,32 @@ export function createCodexReader(dependencies: ReaderDependencies = {}): Native
       warnings.add(
         "Codex native history provides only the current thread model; historical per-turn model provenance is unavailable.",
       );
-    if (nativeTurns.length === 0 && thread.preview.trim())
+    const rollout = nativeTurns.length === 0 ? await emptyRollout(thread.path) : undefined;
+    const compressed = typeof rollout === "object";
+    const inherited =
+      compressed && (await verifyCompressedRolloutWithoutLocalHistory(rollout.path, id));
+    if (nativeTurns.length === 0 && rollout === undefined && thread.preview.trim())
       throw new Error(
         "Codex returned no turns for a nonempty session. Its native history store may be unavailable; refusing an incomplete import.",
       );
     let active = record(thread.status)?.type === "active";
     const turns: NativeHistoryTurn[] = [];
     const nativeMetadata: JsonValue[] = [];
+    if (rollout !== undefined) {
+      // Preserve the existing indexed-path record for an absent .jsonl, even if its compressed sibling exists.
+      const type =
+        compressed && thread.path === rollout.path
+          ? "codex.compressed_without_local_history"
+          : "codex.missing_rollout";
+      nativeMetadata.push(json({ type, sourceId: id, nativeThread: thread }));
+      warnings.add(
+        compressed
+          ? inherited
+            ? "Codex supplied only session metadata. The compressed rollout contains only inherited parent history."
+            : "Codex supplied only session metadata. The compressed rollout contains only a session header."
+          : "Codex supplied only session metadata. The native API returned no turns and its rollout path is absent.",
+      );
+    }
     const sourceCoverage: NonNullable<NativeConversation["sourceCoverage"]> = {
       schemaVersion: 1,
       selectedRecords: 0,
@@ -870,9 +982,14 @@ export function createCodexReader(dependencies: ReaderDependencies = {}): Native
       turns.push({ id: turn.id, status, startedAt, completedAt, items });
     }
     const children: NativeConversation[] = [];
-    for (const [childId, reference] of references) {
+    const retainedChildMetadata: string[] = [];
+    let retainedCompressedWithoutLocalHistory = 0;
+    const listedIds = listedChildren.get(id);
+    const candidates = new Set([...references.keys(), ...[...(listedIds ?? [])].sort()]);
+    for (const childId of candidates) {
+      const reference = references.get(childId);
       if (ancestry.has(childId)) {
-        if (reference.spawned)
+        if (reference?.spawned || listedIds?.has(childId))
           throw new Error(
             `Codex child-session lineage contains a cycle at '${childId}'; refusing partial history.`,
           );
@@ -882,9 +999,15 @@ export function createCodexReader(dependencies: ReaderDependencies = {}): Native
       const childThread = (
         await rpc.request("thread/read", { threadId: childId, includeTurns: false })
       ).thread;
+      if (childThread.id !== childId)
+        throw new Error("Codex returned another session while reading a native child.");
       const nativeParent = nativeParentId(childThread);
+      if (listedIds?.has(childId) && nativeParent !== id)
+        throw new Error(
+          `Codex child '${childId}' changed native parent after listing; retry when the source is stable.`,
+        );
       if (nativeParent && nativeParent !== id) continue; // A wait may mention a descendant or a peer owned by another native parent.
-      if (!nativeParent && !reference.spawned) {
+      if (!nativeParent && !reference?.spawned) {
         warnings.add(
           `Codex referenced session '${childId}' without native parent metadata or a spawn event; its tool reference was retained without inventing lineage.`,
         );
@@ -896,15 +1019,35 @@ export function createCodexReader(dependencies: ReaderDependencies = {}): Native
           "Codex child-session traversal exceeded its safety bound; refusing partial history.",
         );
       const { workspace: _parentWorkspace, ...childOptions } = options;
-      const child = await readOne(
+      const childRead = await readOne(
         childId,
         childOptions,
         seen,
         new Set([...ancestry, childId]),
         childThread,
       );
-      child.parent = { sourceId: id, nativeItemId: reference.nativeItemId };
-      if (reference.spawned && reference.prompt?.trim()) {
+      const child = childRead.conversation;
+      child.parent = {
+        sourceId: id,
+        ...(reference ? { nativeItemId: reference.nativeItemId } : {}),
+      };
+      if (child.historyMetadataOnly && !child.active && !child.children?.length) {
+        const [header, ...descendants] = child.nativeMetadata!;
+        nativeMetadata.push(
+          json({
+            ...record(header),
+            parent: child.parent,
+            archived: archiveStatus.get(childId) ?? hasArchivedRollout(child),
+          }),
+          ...descendants,
+        );
+        retainedChildMetadata.push(childId, ...(child.retainedChildMetadata ?? []));
+        retainedCompressedWithoutLocalHistory +=
+          Number(childRead.compressedWithoutLocalHistory) +
+          childRead.retainedCompressedWithoutLocalHistory;
+        continue;
+      }
+      if (reference?.spawned && reference.prompt?.trim()) {
         if (child.title === "Untitled Codex session")
           child.title = reference.prompt.trim().slice(0, 160);
         const first = child.turns[0];
@@ -924,10 +1067,28 @@ export function createCodexReader(dependencies: ReaderDependencies = {}): Native
       children.push(child);
       if (child.active) active = true;
     }
+    if (retainedCompressedWithoutLocalHistory) {
+      warnings.add(
+        `Codex returned metadata only for ${retainedChildMetadata.length} descendant session(s). Their metadata is retained on this thread.`,
+      );
+      warnings.add(
+        `${retainedCompressedWithoutLocalHistory} compressed descendant rollout(s) contain only inherited parent history or a session header.`,
+      );
+      const retainedAbsent = retainedChildMetadata.length - retainedCompressedWithoutLocalHistory;
+      if (retainedAbsent) warnings.add(`${retainedAbsent} descendant rollout path(s) are absent.`);
+    } else if (retainedChildMetadata.length) {
+      warnings.add(
+        `Codex returned metadata only for ${retainedChildMetadata.length} descendant session(s). Their rollout paths are absent, and their metadata is retained on this thread.`,
+      );
+    }
     const after = (await rpc.request("thread/read", { threadId: id, includeTurns: false })).thread;
     if (
+      after.id !== id ||
       after.updatedAt !== thread.updatedAt ||
       after.cwd !== thread.cwd ||
+      after.path !== thread.path ||
+      nativeParentId(after) !== nativeParentId(thread) ||
+      (rollout !== undefined && !sameEmptyRollout(rollout, await emptyRollout(after.path))) ||
       record(after.status)?.type === "active"
     )
       active = true;
@@ -936,22 +1097,34 @@ export function createCodexReader(dependencies: ReaderDependencies = {}): Native
         "The source session is active or changed during reading. Import must wait for it to settle.",
       );
     return {
-      ...summary(thread),
-      nativeSessionRef: thread.id,
-      sourceHome: resolve(options.sourceHome || process.env.CODEX_HOME || `${homedir()}/.codex`),
-      driver: "codex",
-      turns,
-      sourceCoverage: { ...sourceCoverage, nativeKinds: Object.fromEntries(nativeKinds) },
-      ...(nativeMetadata.length ? { nativeMetadata } : {}),
-      ...(children.length ? { children } : {}),
-      warnings: [...warnings],
-      active,
+      compressedWithoutLocalHistory: compressed,
+      retainedCompressedWithoutLocalHistory,
+      conversation: {
+        ...summary(thread),
+        nativeSessionRef: thread.id,
+        sourceHome: resolve(options.sourceHome || process.env.CODEX_HOME || `${homedir()}/.codex`),
+        driver: "codex",
+        turns,
+        sourceCoverage: { ...sourceCoverage, nativeKinds: Object.fromEntries(nativeKinds) },
+        ...(nativeMetadata.length ? { nativeMetadata } : {}),
+        ...(children.length ? { children } : {}),
+        ...(retainedChildMetadata.length ? { retainedChildMetadata } : {}),
+        ...(rollout !== undefined
+          ? { historyMetadataOnly: "missing-native-transcript", resumeSupported: false }
+          : {}),
+        warnings: [...warnings],
+        active,
+      },
     };
   };
-  const archiveStatus = new Map<string, boolean>();
   const listed = new Set<string>();
   const listKey = (options: NativeReadOptions) =>
-    JSON.stringify([options.workspace, options.archived === true, options.since]);
+    JSON.stringify([
+      options.workspace,
+      options.archived === true,
+      options.since,
+      options.codexIndexOnly === true,
+    ]);
   const list = async (options: NativeReadOptions): Promise<NativeSourceSummary[]> => {
     const archived = options.archived === true;
     const rpc = await connect(options);
@@ -971,6 +1144,7 @@ export function createCodexReader(dependencies: ReaderDependencies = {}): Native
         sortKey: "updated_at",
         sortDirection: "desc",
         sourceKinds: SOURCE_KINDS,
+        ...(options.codexIndexOnly ? { useStateDbOnly: true } : {}),
         ...(options.workspace ? { cwd: canonicalPath(options.workspace) } : {}),
       });
       for (const thread of page.data) {
@@ -984,11 +1158,20 @@ export function createCodexReader(dependencies: ReaderDependencies = {}): Native
         };
         if (options.workspace && !sameWorkspace(candidate.workspace, options.workspace)) continue;
         if (since !== undefined && Date.parse(candidate.updatedAt) < since) continue;
-        archiveStatus.set(candidate.id, archived);
         results.push(candidate);
       }
       cursor = assertCursor(page.nextCursor, cursors, "threads");
       if (cursor === null) {
+        for (const { id, parentSessionId } of results) {
+          archiveStatus.set(id, archived);
+          if (!parentSessionId) continue;
+          let children = listedChildren.get(parentSessionId);
+          if (!children) {
+            children = new Set();
+            listedChildren.set(parentSessionId, children);
+          }
+          children.add(id);
+        }
         listed.add(listKey(options));
         return results;
       }
@@ -1000,17 +1183,21 @@ export function createCodexReader(dependencies: ReaderDependencies = {}): Native
   return {
     list,
     async read(id, options) {
-      const conversation = await readOne(id, options, new Set([id]), new Set([id]));
+      const rpc = await connect(options);
+      const { thread } = await rpc.request("thread/read", { threadId: id, includeTurns: false });
+      if (thread.id !== id)
+        throw new Error("Codex returned another session while reading history.");
       const { since: _since, ...lookupOptions } = options;
       for (const archived of options.archived ? [true] : [false, true]) {
         if (archiveStatus.has(id) && (!options.archived || archiveStatus.get(id) === true)) break;
         const scope = {
           ...lookupOptions,
-          workspace: options.workspace ?? conversation.workspace,
+          workspace: options.workspace ?? thread.cwd,
           archived,
         };
         if (!listed.has(listKey(scope))) await list(scope);
       }
+      const { conversation } = await readOne(id, options, new Set([id]), new Set([id]), thread);
       // The native picker may omit an internal thread even when thread/read can open its archive.
       const archived =
         archiveStatus.get(id) ?? (hasArchivedRollout(conversation) ? true : undefined);

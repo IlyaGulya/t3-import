@@ -51,7 +51,21 @@ node dist/cli.js import --source codex --workspace /path/to/project --thread SES
 
 Repeat `--thread` to select several sessions, or use `--all` with `--workspace`. `--since ISO_TIMESTAMP` filters by updated time. `--source-home` selects another Codex home; `--binary` selects the Codex executable. The reader pages through full native history and never starts/resumes a model turn.
 
-Root sessions go into the normal T3 project list and stay visible when T3's automatic settlement runs. Use `--settled` to put them on the Settled shelf instead. A confirmed source archive always goes to T3 Archived, using the last source update time when the archive time is unavailable. `--archived` selects confirmed Codex archives or OMP cold archives. An explicit session ID can also find a source archive without that flag. Codex can confirm an unlisted thread from the rollout path returned by its native history API. Claude Code's SDK cannot establish archive status, so its sessions follow the normal import placement. These choices apply when creating imported threads; existing threads keep their state.
+Codex family discovery combines parent metadata from the native session list with launch records in the transcript. If the native API returns zero turns and the rollout is absent, the importer retains the available metadata. It also recognizes `.jsonl.zst` files next to indexed `.jsonl` paths. For those files it checks the native subagent boundary and record ordinals without decoding transcript events. Files with only a session header or inherited history retain metadata. A compressed rollout with local records that the API cannot read fails the family. The report identifies retained children under `retainedChildMetadata` and distinguishes compressed rollouts without local records from absent files. A standalone session without a transcript is flagged as `historyMetadataOnly` and has no continuation.
+
+`--archived` selects confirmed Codex archives or OMP cold archives. An explicit session ID can also find a source archive without that flag. Codex can confirm an unlisted thread from the rollout path returned by its native history API. Claude Code's SDK cannot establish archive status.
+
+## Thread placement
+
+Both `import` and `import-all` import the selected history and its family links. Placement controls where a newly imported thread appears in T3:
+
+- Recent roots stay in the normal project list. Families with no substantive activity for 30 days put the root on the Settled shelf. The clock uses the latest activity anywhere in the family, including nested children and failed or interrupted turns. A source update time is used when available history cannot establish activity.
+- Historical children are Settled. A leaf subagent goes to Archived if native history confirms completed turns with zero transcript records and no missing descendants. Forks, failed or interrupted runs, and children with visible content stay readable in T3.
+- Confirmed source archives stay archived. Where the source does not provide an archive timestamp, T3 uses the last source update time.
+
+Change the threshold with `--old-family-days <days>`. Choose `--old-family-action keep` to leave inactive roots in the project list, or `--old-family-action archive` to archive every member of an inactive family. Use `--no-archive-empty-children` to leave confirmed empty subagents Settled. `--settled` explicitly settles roots that would otherwise remain in the project list.
+
+Dry-run reports `placementCounts` and each thread's `placement` with its reason. Placement applies when creating threads, and reimport reports the existing placement.
 
 ## Project grouping
 
@@ -117,6 +131,8 @@ node dist/cli.js import --source claude --workspace /path/to/project --thread SE
 
 When a native child has no matching launch item in the selected parent history, its thread relationship is retained without assigning it to a guessed parent turn. Its historical activity stays outside unrelated response durations.
 
+Children with cyclic native parent references stay under the family root with the reported references retained in metadata. Claude histories that contain only local-command records can be retained as metadata-only threads when the SDK supplies a workspace.
+
 Saved pre-compaction epochs are read through the SDK using native compaction anchors. The SDK resolves each epoch's branch; missing saved heads produce `native_history_gap` instead of invented records. Exact native task IDs link older child launches to their original tool calls. Inherited copies of parent context are preserved as metadata rather than repeated as new child work; native history forks use T3 fork lineage.
 
 Native interruption markers become T3 interruption items. A partial reply preceding an interruption remains an assistant reply with interrupted status. Local slash-command envelopes and command stdout remain metadata, preventing empty work folds and spurious user requests. Idle acknowledgements do not extend a completed response.
@@ -172,6 +188,8 @@ Historical file links use their original directories. A deleted file or moved pr
 
 `import-all` discovers all workspaces exposed by the local Codex, Claude Code and OMP history APIs, including Codex and OMP archives. It imports history without continuation bindings and keeps each family of linked threads in one transaction. Use `--source codex`, `--source claude` or `--source omp` to limit the run.
 
+If a Codex inventory scan times out, `--codex-index-only` uses the app-server's existing state index for discovery in both live and archived history. Unindexed rollouts are outside this inventory. The report identifies the mode as `codexInventory: "native-state-index"`.
+
 ```sh
 node dist/cli.js import-all --dry-run --snapshot
 # Quit T3 Code and stop any separate server before applying.
@@ -180,7 +198,19 @@ node dist/cli.js import-all --yes --snapshot
 
 `--snapshot` preserves unfinished Claude tails and OMP tails without a live lease as interrupted history. `--dry-run` can run alongside T3. It reads and validates the selected history without writing. `--yes` checks that T3 is stopped, acquires its ownership lock and checks the database schema and integrity before opening any source reader. It holds the lock until the run ends. The first batch that writes creates one verified SQLite backup for the run. Dry runs and runs with nothing new to write create no backup.
 
-Source errors and rejected families are listed under `failures` and produce a nonzero exit status. Independent families can still import. Unexpected target errors stop the run and report the backup path if one was created. After resolving the reported problem, rerun the same command. A committed, unchanged family reports `already-imported`. Conflicts leave existing history intact. The SQLite backup covers the database. For a full rollback that also restores settings and attachments, make a separate copy of `userdata` with T3 stopped before applying.
+Source errors and rejected families are listed under `failures` and produce a nonzero exit status. Independent families can still import. Unexpected target errors stop the run and report the backup path if one was created. A committed, unchanged family reports `already-imported`. Conflicts leave existing history intact. The SQLite backup covers the database. For a full rollback that also restores settings and attachments, make a separate copy of `userdata` with T3 stopped before applying.
+
+### Retry deferred families
+
+A write run with remaining work saves a private JSON retry file under `userdata/t3-import-retries/`. The report gives its path in `retryFile`. Use `--retry-file` to choose a new output path or to save a retry file from a dry-run. A dry-run retry file records only failed work. Use the original import command to write the families that passed the dry-run.
+
+```sh
+node dist/cli.js import-all --yes --snapshot --retry-file ./remaining.json
+node dist/cli.js import-all --retry-from ./remaining.json --dry-run
+node dist/cli.js import-all --retry-from ./remaining.json --yes
+```
+
+The file records the target home, reader and placement options, and sessions to revisit. The retry checks native inventory and reads the selected families with their current ancestry. If inventory fails or a fatal error stops the run, the file retains the original selection for that source. The import ledger recognizes committed families on replay. The original retry file remains usable. A partial write retry emits a fresh file for the remaining work. Every write run uses the same stopped-server check and takes one backup before its first write.
 
 ## Automatic import audit
 

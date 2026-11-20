@@ -160,6 +160,29 @@ function supplementalRecord(entry: SessionStoreEntry): SessionStoreEntry {
       : { message: Object.keys(message).length ? header : entry.message }),
   };
 }
+
+function cyclicParentIds(agents: ReadonlyMap<string, { parentAgent: string | null }>): Set<string> {
+  const cyclic = new Set<string>();
+  const visited = new Set<string>();
+  for (const agentId of agents.keys()) {
+    const ancestry = new Set<string>();
+    let parent: string | null = agentId;
+    while (parent && agents.has(parent) && !visited.has(parent)) {
+      if (ancestry.has(parent)) {
+        const cycleStart = parent;
+        do {
+          cyclic.add(parent);
+          parent = agents.get(parent)!.parentAgent!;
+        } while (parent !== cycleStart);
+        break;
+      }
+      ancestry.add(parent);
+      parent = agents.get(parent)!.parentAgent;
+    }
+    for (const id of ancestry) visited.add(id);
+  }
+  return cyclic;
+}
 function recordDigest(
   digests: Map<string, ReturnType<typeof createHash>>,
   key: string,
@@ -657,6 +680,11 @@ function mapMessages(
     warnings.add(
       "Claude snapshot imported without live process ownership verification; unfinished native tails remain interrupted and this history cannot bind a continuation. Use a copied, stable native store.",
     );
+  const metadataOnly = settled && turns.length === 0 && nativeMetadata.length > 0;
+  if (metadataOnly)
+    warnings.add(
+      "Claude supplied native metadata without a visible transcript turn. The history is retained without a continuation.",
+    );
   return {
     ...meta,
     ...(model ? { model } : {}),
@@ -685,7 +713,8 @@ function mapMessages(
     turns,
     warnings: [...warnings],
     active: !settled && !snapshot,
-    ...(snapshot ? { resumeSupported: false } : {}),
+    ...(snapshot || metadataOnly ? { resumeSupported: false } : {}),
+    ...(metadataOnly ? { historyMetadataOnly: "no-visible-turns" } : {}),
   };
 }
 async function execute(request: Request): Promise<NativeSourceSummary[] | NativeConversation> {
@@ -764,7 +793,12 @@ async function execute(request: Request): Promise<NativeSourceSummary[] | Native
     ...options,
     includeSystemMessages: true,
   });
-  if (!messages.length) throw new Error("Claude SDK returned no historical messages.");
+  if (!messages.length)
+    throw new Error(
+      info.cwd
+        ? "Claude SDK returned no historical messages."
+        : "Claude SDK supplied no historical messages or workspace for this metadata-only session.",
+    );
   // The SDK owns branch selection and file parsing. Enrich one selected
   // history at a time as its native store batches arrive, without retaining
   // another full copy of a large subagent family.
@@ -1005,8 +1039,8 @@ async function execute(request: Request): Promise<NativeSourceSummary[] | Native
         };
         child.title = `Claude history fork ${currentAgent}`;
       }
-      child.createdAt = child.turns[0]!.startedAt;
-      child.updatedAt = child.turns.at(-1)!.completedAt;
+      child.createdAt = child.turns[0]?.startedAt ?? child.createdAt;
+      child.updatedAt = child.turns.at(-1)?.completedAt ?? child.updatedAt;
       agents.set(currentAgent, {
         conversation: child,
         parentAgent,
@@ -1125,16 +1159,20 @@ async function execute(request: Request): Promise<NativeSourceSummary[] | Native
       result.warnings.push(
         `Native Claude subagent '${agentId}' has no readable selected history; it was omitted.`,
       );
+  const cyclic = cyclicParentIds(agents);
   for (const [agentId, { conversation: child, parentAgent }] of [...agents].sort(([a], [b]) =>
     a.localeCompare(b),
   )) {
-    const visited = new Set([agentId]);
-    let parent = parentAgent;
-    while (parent && agents.has(parent)) {
-      if (visited.has(parent))
-        throw new Error("Claude native subagent metadata contains a parent cycle.");
-      visited.add(parent);
-      parent = agents.get(parent)!.parentAgent;
+    if (cyclic.has(agentId)) {
+      child.nativeMetadata!.push(
+        json({ type: "claude_unresolved_parent", reason: "cycle", nativeParent: child.parent }),
+      );
+      result.warnings.push(
+        `Native Claude subagent '${agentId}' has cyclic parent metadata; its transcript is kept under the family root with the reported parent retained in metadata.`,
+      );
+      child.parent = { sourceId: result.id };
+      (result.children ??= []).push(child);
+      continue;
     }
     const owner = parentAgent ? agents.get(parentAgent)?.conversation : result;
     if (!owner) {
