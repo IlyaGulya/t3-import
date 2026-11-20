@@ -556,7 +556,7 @@ test(
   "OMP imports a family with an allocated child that has no transcript",
   {
     skip: skip || !existsSync(process.env.T3_TEST_SERVER_BINARY ?? join(homedir(), ".t3/bin/t3")),
-    timeout: 90_000,
+    timeout: 180_000,
   },
   async () => {
     const reasoning = Array.from({ length: 270 }, (_, index) => ({

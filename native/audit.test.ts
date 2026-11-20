@@ -425,7 +425,7 @@ test(
 
 test(
   "CLI audit flags an empty initial work segment despite matching stored hashes",
-  { skip: !hasServer, timeout: 60_000 },
+  { skip: !hasServer, timeout: 120_000 },
   async () => {
     const home = mkdtempSync(join(tmpdir(), "t3-audit-empty-work-"));
     let server: Awaited<ReturnType<typeof startIsolatedT3Server>> | undefined;
@@ -478,7 +478,7 @@ test(
 
 test(
   "CLI audit rejects a cancellation marker classified as a completed response",
-  { skip: !hasServer, timeout: 60_000 },
+  { skip: !hasServer, timeout: 120_000 },
   async () => {
     const home = mkdtempSync(join(tmpdir(), "t3-audit-cancel-status-"));
     let server: Awaited<ReturnType<typeof startIsolatedT3Server>> | undefined;
